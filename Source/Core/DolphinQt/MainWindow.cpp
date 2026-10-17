@@ -149,7 +149,7 @@
 #include "VideoCommon/NetPlayChatUI.h"
 
 #ifdef HAVE_XRANDR
-//#include "UICommon/X11Utils.h"
+#include "UICommon/X11Utils.h"
 // This #define within X11/X.h conflicts with our WiimoteSource enum.
 #undef None
 #endif
@@ -2584,7 +2584,7 @@ void MainWindow::StartManagedNetPlay()
 
   if (!m_managed_session->wii_save_data_bin_path.empty() &&
       WiiSave::ImportForNetplay(m_managed_session->wii_save_data_bin_path,
-                                selected_game.GetTitleID()) != WiiSave::CopyResult::Success)
+                                selected_game.GetTitleID()) != WiiSave::CopyResult(0))
   {
     FailManagedSession("The configured Wii data.bin save is invalid or belongs to another game");
     m_managed_session.reset();
