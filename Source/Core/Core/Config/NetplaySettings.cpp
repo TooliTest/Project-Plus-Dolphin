@@ -47,7 +47,7 @@ const Info<u32> NETPLAY_CLIENT_BUFFER_SIZE{{System::Main, "NetPlay", "BufferSize
 const Info<u32> NETPLAY_ROLLBACK_FRAMES{{System::Main, "NetPlay", "RollbackFrames"}, 5};
 const Info<u32> NETPLAY_ROLLBACK_INPUT_DELAY{{System::Main, "NetPlay", "RollbackInputDelay"}, 1};
 const Info<u32> NETPLAY_ROLLBACK_FRAME_BOUNDARY{
-    {System::Main, "NetPlay", "RollbackFrameBoundary"}, 1};
+    {System::Main, "NetPlay", "RollbackFrameBoundary"}, 2};
 
 const Info<bool> NETPLAY_BRAWL_MUSIC_OFF{{System::Main, "NetPlay", "BrawlMusicOff"}, false};
 const Info<bool> NETPLAY_SPECTATOR_MODE{{System::Main, "NetPlay", "IsSpectator"}, false};
@@ -69,6 +69,8 @@ const Info<bool> NETPLAY_ROLLBACK_FULL_SCAN_KEEP_TRACKING{
     {System::Main, "NetPlay", "RollbackFullScanKeepTracking"}, false};
 const Info<bool> NETPLAY_ROLLBACK_COMPARE_CONFIRMED_RAM{
     {System::Main, "NetPlay", "RollbackCompareConfirmedRAM"}, false};
+const Info<bool> NETPLAY_ROLLBACK_COMPARE_CONFIRMED_VIDEO{
+    {System::Main, "NetPlay", "RollbackCompareConfirmedVideo"}, false};
 const Info<bool> NETPLAY_ROLLBACK_STOP_RAM_COMPARE_ON_MISMATCH{
     {System::Main, "NetPlay", "RollbackStopRAMCompareOnMismatch"}, false};
 const Info<bool> NETPLAY_ROLLBACK_DEEP_LOGGING{

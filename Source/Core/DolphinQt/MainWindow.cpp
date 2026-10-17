@@ -66,12 +66,13 @@
 #include "Core/HW/GCKeyboard.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/ProcessorInterface.h"
-#include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/SI/SI.h"
+#include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/Wiimote.h"
+#include "Core/HW/WiiSave.h"
 #include "Core/HotkeyManager.h"
-#include "Core/IOS/USB/Bluetooth/BTEmu.h"
 #include "Core/IOS/FS/FileSystem.h"
+#include "Core/IOS/USB/Bluetooth/BTEmu.h"
 #include "Core/Movie.h"
 #include "Core/NetPlayClient.h"
 #include "Core/NetPlayProto.h"
@@ -275,6 +276,7 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
 
   if (!brawlback_ticket_path.empty())
   {
+    NOTICE_LOG_FMT(NETPLAY, "Managed launch requested: ticket='{}'", brawlback_ticket_path);
     m_managed_session.emplace();
     m_managed_session->ticket_path = brawlback_ticket_path;
     QTimer::singleShot(0, this, &MainWindow::StartManagedNetPlay);
@@ -452,7 +454,6 @@ void MainWindow::InitCoreCallbacks()
     {
       QTimer::singleShot(0, this, &MainWindow::TryStartManagedNetplayReplay);
     }
-
   });
   installEventFilter(this);
   m_render_widget->installEventFilter(this);
@@ -650,7 +651,12 @@ void MainWindow::ConnectHotkeys()
           &MainWindow::OnRequestGolfControl);
   connect(m_hotkey_scheduler, &HotkeyScheduler::RefreshGameListHotkey, this,
           &MainWindow::RefreshGameList);
-  connect(m_hotkey_scheduler, &HotkeyScheduler::StopHotkey, this, &MainWindow::RequestStop);
+  connect(m_hotkey_scheduler, &HotkeyScheduler::StopHotkey, this, [this] {
+    if (m_managed_session)
+      ForceManagedProcessExit(true);
+    else
+      RequestStop();
+  });
   connect(m_hotkey_scheduler, &HotkeyScheduler::ResetHotkey, this, &MainWindow::Reset);
   connect(m_hotkey_scheduler, &HotkeyScheduler::ScreenShotHotkey, this, &MainWindow::ScreenShot);
   connect(m_hotkey_scheduler, &HotkeyScheduler::FullScreenHotkey, this, &MainWindow::FullScreen);
@@ -836,8 +842,8 @@ void MainWindow::TryCompleteFullscreenBoot()
     INFO_LOG_FMT(VIDEO,
                  "Fullscreen boot: window settled at {}x{} (observed surface {}x{}, dpr={:.3f}); "
                  "initializing backend {}",
-                 current_width, current_height, m_fullscreen_boot_width,
-                 m_fullscreen_boot_height, dpr, Config::Get(Config::MAIN_GFX_BACKEND));
+                 current_width, current_height, m_fullscreen_boot_width, m_fullscreen_boot_height,
+                 dpr, Config::Get(Config::MAIN_GFX_BACKEND));
 
     auto parameters = std::move(m_pending_fullscreen_boot);
     m_fullscreen_boot_state_observed = false;
@@ -1040,6 +1046,10 @@ void MainWindow::TogglePause()
 
 void MainWindow::OnStopComplete()
 {
+  NOTICE_LOG_FMT(CORE,
+                 "Shutdown lifecycle: Qt observed Core::State::Uninitialized "
+                 "(stop_requested={}, exit_requested={}, managed={})",
+                 m_stop_requested, m_exit_requested, m_managed_session.has_value());
   m_stop_requested = false;
   HideRenderWidget(!m_exit_requested, m_exit_requested);
 #ifdef USE_DISCORD_PRESENCE
@@ -1071,9 +1081,28 @@ void MainWindow::OnStopComplete()
 
 bool MainWindow::RequestStop()
 {
+  NOTICE_LOG_FMT(
+      CORE,
+      "Shutdown lifecycle: MainWindow::RequestStop entered "
+      "(core_state={}, stop_requested={}, netplay={}, gekko={}, managed={}, fullscreen={})",
+      static_cast<int>(Core::GetState(m_system)), m_stop_requested, NetPlay::IsNetPlayRunning(),
+      Rollback::IsGekkoSessionActive(), m_managed_session.has_value(),
+      m_render_widget->isFullScreen());
   if (Core::IsUninitialized(m_system))
   {
+    NOTICE_LOG_FMT(CORE, "Shutdown lifecycle: core already uninitialized; queueing Qt completion");
     Core::QueueHostJob([this](Core::System&) { OnStopComplete(); }, true);
+    return true;
+  }
+
+  // A single close action can produce close requests for both the render widget and the main
+  // window.  Do not reinterpret that duplicate as an immediate force-stop while the guest is
+  // still flushing its Wii save data.  The first request installs a bounded fallback below.
+  if (m_stop_requested)
+  {
+    NOTICE_LOG_FMT(CORE,
+                   "Shutdown lifecycle: duplicate RequestStop ignored while graceful shutdown is "
+                   "pending");
     return true;
   }
 
@@ -1163,12 +1192,30 @@ bool MainWindow::RequestStop()
     }
   }
 
+  NOTICE_LOG_FMT(CORE, "Shutdown lifecycle: stopping replay/movie recording");
   OnStopRecording();
+  NOTICE_LOG_FMT(CORE, "Shutdown lifecycle: replay/movie recording stopped");
   // TODO: Add Debugger shutdown
 
-  if (!m_stop_requested && UICommon::TriggerSTMPowerEvent())
+  const bool may_request_graceful_shutdown = !m_stop_requested;
+  const bool stm_power_event_sent =
+      may_request_graceful_shutdown && UICommon::TriggerSTMPowerEvent();
+  NOTICE_LOG_FMT(CORE,
+                 "Shutdown lifecycle: graceful Wii shutdown decision "
+                 "(eligible={}, stm_event_sent={})",
+                 may_request_graceful_shutdown, stm_power_event_sent);
+  if (stm_power_event_sent)
   {
     m_stop_requested = true;
+
+    QTimer::singleShot(10000, this, [this] {
+      if (!m_stop_requested || Core::IsUninitialized(m_system))
+        return;
+
+      WARN_LOG_FMT(CORE, "Shutdown lifecycle: guest STM shutdown did not finish within 10 seconds; "
+                         "using safe forced-stop fallback");
+      ForceStop();
+    });
 
     // Unpause because gracefully shutting down needs the game to actually request a shutdown.
     // TODO: Do not unpause in debug mode to allow debugging until the complete shutdown.
@@ -1177,11 +1224,17 @@ bool MainWindow::RequestStop()
 
     // Tell NetPlay about the power event
     if (NetPlay::IsNetPlayRunning())
+    {
+      NOTICE_LOG_FMT(CORE, "Shutdown lifecycle: broadcasting NetPlay power-button event");
       NetPlay::SendPowerButtonEvent();
+    }
 
+    NOTICE_LOG_FMT(CORE, "Shutdown lifecycle: waiting for guest STM shutdown request");
     return true;
   }
 
+  NOTICE_LOG_FMT(CORE,
+                 "Shutdown lifecycle: graceful path unavailable/already pending; forcing stop");
   ForceStop();
 #ifdef Q_OS_WIN
   // Allow windows to idle or turn off display again
@@ -1192,7 +1245,30 @@ bool MainWindow::RequestStop()
 
 void MainWindow::ForceStop()
 {
+  NOTICE_LOG_FMT(CORE,
+                 "Shutdown lifecycle: MainWindow::ForceStop calling Core::Stop "
+                 "(core_state={}, netplay={}, gekko={})",
+                 static_cast<int>(Core::GetState(m_system)), NetPlay::IsNetPlayRunning(),
+                 Rollback::IsGekkoSessionActive());
   Core::Stop(m_system);
+}
+
+void MainWindow::ForceManagedProcessExit(bool notify_peers)
+{
+  if (m_exit_requested)
+    return;
+
+  NOTICE_LOG_FMT(CORE,
+                 "Shutdown lifecycle: forcing managed process exit (notify_peers={})",
+                 notify_peers);
+  m_exit_requested = true;
+  m_stop_requested = true;
+
+  if (notify_peers && NetPlay::IsNetPlayRunning())
+    NetPlay::SendPowerButtonEvent();
+
+  OnStopRecording();
+  ForceStop();
 }
 
 void MainWindow::Reset()
@@ -1360,9 +1436,8 @@ void MainWindow::BootGame(std::unique_ptr<BootParameters>&& parameters)
   const qreal dpr = m_render_widget->devicePixelRatioF();
   INFO_LOG_FMT(VIDEO,
                "Boot surface: fullscreen={}, widget={}x{}, physical={}x{}, dpr={:.3f}, backend={}",
-               m_render_widget->isFullScreen(), m_render_widget->width(),
-               m_render_widget->height(), qRound(m_render_widget->width() * dpr),
-               qRound(m_render_widget->height() * dpr), dpr,
+               m_render_widget->isFullScreen(), m_render_widget->width(), m_render_widget->height(),
+               qRound(m_render_widget->width() * dpr), qRound(m_render_widget->height() * dpr), dpr,
                Config::Get(Config::MAIN_GFX_BACKEND));
 
   // Boot up, show an error if it fails to load the game.
@@ -1378,7 +1453,6 @@ void MainWindow::BootGame(std::unique_ptr<BootParameters>&& parameters)
   if (!NetPlay::IsNetPlayRunning())
     Discord::UpdateDiscordPresence();
 #endif
-
 }
 
 void MainWindow::SetFullScreenResolution(bool fullscreen)
@@ -1768,6 +1842,17 @@ void MainWindow::NetPlayInit()
 #endif
 
   connect(m_netplay_dialog, &NetPlayDialog::Stop, this, &MainWindow::ForceStop);
+  connect(m_netplay_dialog, &NetPlayDialog::PowerButtonReceived, this, [this] {
+    if (m_managed_session)
+    {
+      ForceManagedProcessExit(false);
+      return;
+    }
+
+    const bool sent = UICommon::TriggerSTMPowerEvent();
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Shutdown lifecycle: queued NetPlay STM power event completed (sent={})", sent);
+  });
   connect(m_netplay_dialog, &NetPlayDialog::ConnectionFailed, this,
           [this](const QString& message) { FailManagedSession(message.toStdString()); });
   connect(m_netplay_dialog, &NetPlayDialog::rejected, this, &MainWindow::NetPlayQuit);
@@ -1788,19 +1873,39 @@ void MainWindow::NetPlayInit()
 void MainWindow::ReportManagedStatus(const std::string& state, const std::string& reason)
 {
   if (!m_managed_session || m_managed_session->status_path.empty())
+  {
+    ERROR_LOG_FMT(NETPLAY,
+                  "Managed launch could not report status '{}' because no status path is set",
+                  state);
     return;
+  }
 
   picojson::object status;
   status["matchId"] = picojson::value(m_managed_session->match_id);
   status["state"] = picojson::value(state);
   status["reason"] = picojson::value(reason);
-  File::WriteStringToFile(m_managed_session->status_path, picojson::value(status).serialize());
+  if (!File::WriteStringToFile(m_managed_session->status_path, picojson::value(status).serialize()))
+  {
+    ERROR_LOG_FMT(NETPLAY, "Managed launch could not write status '{}' to '{}'", state,
+                  m_managed_session->status_path);
+  }
+  else
+  {
+    NOTICE_LOG_FMT(NETPLAY, "Managed launch status: {}{}", state,
+                   reason.empty() ? "" : fmt::format(" ({})", reason));
+  }
 }
 
 void MainWindow::FailManagedSession(const std::string& reason)
 {
-  if (!m_managed_session || m_managed_session->failure_reported)
+  if (!m_managed_session)
+  {
+    ERROR_LOG_FMT(NETPLAY, "Managed launch failed without active session: {}", reason);
     return;
+  }
+  if (m_managed_session->failure_reported)
+    return;
+  ERROR_LOG_FMT(NETPLAY, "Managed launch failed: {}", reason);
   m_managed_session->failure_reported = true;
   ReportManagedStatus("failed", reason);
   QTimer::singleShot(0, qApp, [] { QApplication::exit(1); });
@@ -1842,8 +1947,14 @@ void MainWindow::StartManagedNetPlay()
   picojson::value root;
   std::string parse_error;
   const std::string ticket_path = m_managed_session->ticket_path;
-  if (!JsonFromFile(ticket_path, &root, &parse_error) || !root.is<picojson::object>())
+  NOTICE_LOG_FMT(NETPLAY, "Managed launch: reading ticket '{}' (exists={})", ticket_path,
+                 File::Exists(ticket_path));
+  const bool ticket_read = JsonFromFile(ticket_path, &root, &parse_error);
+  if (!ticket_read || !root.is<picojson::object>())
   {
+    ERROR_LOG_FMT(NETPLAY, "Managed launch: ticket rejected (read={}, object={}, parse_error='{}')",
+                  ticket_read, root.is<picojson::object>(),
+                  parse_error.empty() ? "none" : parse_error);
     QTimer::singleShot(0, qApp, [] { QApplication::exit(1); });
     m_managed_session.reset();
     return;
@@ -1864,12 +1975,21 @@ void MainWindow::StartManagedNetPlay()
   const auto rendezvous_token = read_string("rendezvous_token");
   const auto brawl_iso_path = read_string("brawl_iso_path");
   const auto project_plus_sd_path = read_string("project_plus_sd_path");
+  const auto custom_sd_card_path = read_string("sd_card_path");
   const auto custom_game_path = read_string("game_path");
   const auto custom_game_id = read_string("game_id");
   const auto status_path = read_string("status_path");
   const auto mode = read_string("mode");
   const auto replay_path = read_string("replay_path");
   const auto replay_output_path = read_string("replay_output_path");
+  const auto replay_input_path = read_string("replay_input_path");
+
+  NOTICE_LOG_FMT(NETPLAY,
+                 "Managed launch: ticket parsed (mode='{}', game='{}', match_id={}, player_id={}, "
+                 "rendezvous_addr={}, rendezvous_token={}, status_path={}, fields={})",
+                 mode.value_or("match"), game.value_or("<missing>"), match_id.has_value(),
+                 player_id.has_value(), rendezvous_address.has_value(),
+                 rendezvous_token.has_value(), status_path.has_value(), ticket.size());
 
   if (mode == "netplay_replay")
   {
@@ -1915,6 +2035,16 @@ void MainWindow::StartManagedNetPlay()
     else if (game->rfind("dolphin:", 0) == 0 && custom_game_path && File::Exists(*custom_game_path))
     {
       launch_path = *custom_game_path;
+      if (custom_sd_card_path && !custom_sd_card_path->empty())
+      {
+        if (!File::Exists(*custom_sd_card_path))
+        {
+          Rollback::StopNetplayReplay();
+          FailManagedSession("The configured custom-game SD card is missing");
+          return;
+        }
+        sd_card_path = *custom_sd_card_path;
+      }
     }
     else
     {
@@ -2022,6 +2152,7 @@ void MainWindow::StartManagedNetPlay()
   const auto seat_it = ticket.find("seat");
   const auto players_it = ticket.find("players");
   const auto game_revision_it = ticket.find("game_revision");
+  const auto game_platform_it = ticket.find("game_platform");
   if (match_id)
     m_managed_session->match_id = *match_id;
   if (status_path)
@@ -2030,6 +2161,14 @@ void MainWindow::StartManagedNetPlay()
       !status_path || seat_it == ticket.end() || !seat_it->second.is<double>() ||
       players_it == ticket.end() || !players_it->second.is<picojson::array>())
   {
+    ERROR_LOG_FMT(
+        NETPLAY,
+        "Managed launch: incomplete matchmaking ticket (match_id={}, player_id={}, game={}, "
+        "rendezvous_addr={}, rendezvous_token={}, status_path={}, seat={}, players={})",
+        match_id.has_value(), player_id.has_value(), game.has_value(),
+        rendezvous_address.has_value(), rendezvous_token.has_value(), status_path.has_value(),
+        seat_it != ticket.end() && seat_it->second.is<double>(),
+        players_it != ticket.end() && players_it->second.is<picojson::array>());
     FailManagedSession("The matchmaking ticket is incomplete");
     m_managed_session.reset();
     return;
@@ -2042,17 +2181,26 @@ void MainWindow::StartManagedNetPlay()
   m_managed_session->rendezvous_token = *rendezvous_token;
   m_managed_session->brawl_iso_path = brawl_iso_path.value_or("");
   m_managed_session->project_plus_sd_path = project_plus_sd_path.value_or("");
+  m_managed_session->sd_card_path = custom_sd_card_path.value_or("");
   m_managed_session->game_path = custom_game_path.value_or("");
   m_managed_session->game_id = custom_game_id.value_or("");
   if (game_revision_it != ticket.end() && game_revision_it->second.is<double>())
     m_managed_session->game_revision = static_cast<u16>(game_revision_it->second.get<double>());
+  if (game_platform_it != ticket.end() && game_platform_it->second.is<double>())
+    m_managed_session->game_platform = static_cast<u8>(game_platform_it->second.get<double>());
   m_managed_session->status_path = *status_path;
   m_managed_session->replay_output_path = replay_output_path.value_or("");
+  m_managed_session->replay_input_path = replay_input_path.value_or("");
   m_managed_session->seat = static_cast<int>(seat_it->second.get<double>());
   m_managed_session->player_count =
       static_cast<int>(players_it->second.get<picojson::array>().size());
   m_managed_session->player_ids.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
   m_managed_session->player_names.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
+  m_managed_session->controller_types.resize(
+      static_cast<size_t>(m_managed_session->player_count) + 1,
+      static_cast<u8>(Rollback::ControllerType::GameCube));
+  m_managed_session->controller_tags.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
+  m_managed_session->controller_profiles.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
   const auto test_solo_it = ticket.find("test_solo");
   m_managed_session->test_solo = test_solo_it != ticket.end() && test_solo_it->second.is<bool>() &&
                                  test_solo_it->second.get<bool>();
@@ -2095,8 +2243,18 @@ void MainWindow::StartManagedNetPlay()
   if (frame_boundary_it != ticket.end() && frame_boundary_it->second.is<double>())
   {
     const double boundary = frame_boundary_it->second.get<double>();
-    if (boundary >= 0.0 && boundary <= 3.0)
+    if (boundary >= 0.0 && boundary <= 5.0)
       m_managed_session->frame_boundary = static_cast<u32>(boundary);
+  }
+  const auto gecko_codes_path_it = ticket.find("gecko_codes_path");
+  if (gecko_codes_path_it != ticket.end() && gecko_codes_path_it->second.is<std::string>())
+    m_managed_session->gecko_codes_path = gecko_codes_path_it->second.get<std::string>();
+  const auto wii_save_data_bin_path_it = ticket.find("wii_save_data_bin_path");
+  if (wii_save_data_bin_path_it != ticket.end() &&
+      wii_save_data_bin_path_it->second.is<std::string>())
+  {
+    m_managed_session->wii_save_data_bin_path =
+        wii_save_data_bin_path_it->second.get<std::string>();
   }
   const auto full_scan_it = ticket.find("full_scan_benchmark");
   m_managed_session->full_scan_benchmark = full_scan_it != ticket.end() &&
@@ -2108,7 +2266,8 @@ void MainWindow::StartManagedNetPlay()
                                                full_scan_keep_tracking_it->second.get<bool>();
   const auto parallel_dirty_compare_it = ticket.find("parallel_dirty_compare");
   m_managed_session->parallel_dirty_compare =
-      parallel_dirty_compare_it != ticket.end() && parallel_dirty_compare_it->second.is<bool>() &&
+      parallel_dirty_compare_it == ticket.end() ||
+      !parallel_dirty_compare_it->second.is<bool>() ||
       parallel_dirty_compare_it->second.get<bool>();
   const auto tracked_bitmap_clear_it = ticket.find("tracked_bitmap_clear");
   m_managed_session->tracked_bitmap_clear = tracked_bitmap_clear_it == ticket.end() ||
@@ -2144,6 +2303,14 @@ void MainWindow::StartManagedNetPlay()
   m_managed_session->compare_confirmed_ram = compare_ram_it != ticket.end() &&
                                              compare_ram_it->second.is<bool>() &&
                                              compare_ram_it->second.get<bool>();
+  const auto remote_ram_match_it = ticket.find("remote_ram_match");
+  m_managed_session->remote_ram_match = remote_ram_match_it != ticket.end() &&
+                                        remote_ram_match_it->second.is<bool>() &&
+                                        remote_ram_match_it->second.get<bool>();
+  const auto compare_video_it = ticket.find("compare_confirmed_video");
+  m_managed_session->compare_confirmed_video = compare_video_it != ticket.end() &&
+                                               compare_video_it->second.is<bool>() &&
+                                               compare_video_it->second.get<bool>();
   const auto stop_ram_compare_it = ticket.find("stop_ram_compare_on_mismatch");
   m_managed_session->stop_ram_compare_on_mismatch = stop_ram_compare_it != ticket.end() &&
                                                     stop_ram_compare_it->second.is<bool>() &&
@@ -2176,6 +2343,9 @@ void MainWindow::StartManagedNetPlay()
     const auto id = player.find("player_id");
     const auto name = player.find("display_name");
     const auto roster_seat = player.find("seat");
+    const auto controller_type = player.find("controller_type");
+    const auto controller_tag = player.find("controller_tag");
+    const auto controller_profile = player.find("controller_profile");
     if (id == player.end() || !id->second.is<std::string>() || roster_seat == player.end() ||
         !roster_seat->second.is<double>())
     {
@@ -2187,6 +2357,36 @@ void MainWindow::StartManagedNetPlay()
       m_managed_session->player_ids[parsed_seat] = id->second.get<std::string>();
       if (name != player.end() && name->second.is<std::string>())
         m_managed_session->player_names[parsed_seat] = name->second.get<std::string>();
+      if (controller_type != player.end() && controller_type->second.is<std::string>())
+      {
+        const std::string& value = controller_type->second.get<std::string>();
+        if (value == "wiimote")
+        {
+          m_managed_session->controller_types[parsed_seat] =
+              static_cast<u8>(Rollback::ControllerType::Wiimote);
+        }
+        else if (value != "gamecube")
+        {
+          FailManagedSession("The matchmaking ticket contains an invalid controller type");
+          m_managed_session.reset();
+          return;
+        }
+      }
+      const std::string tag = controller_tag != player.end() && controller_tag->second.is<std::string>() ?
+                                  controller_tag->second.get<std::string>() :
+                                  std::string{};
+      const std::string profile = controller_profile != player.end() &&
+                                          controller_profile->second.is<std::string>() ?
+                                      controller_profile->second.get<std::string>() :
+                                      std::string{};
+      if (!Rollback::ParseBrawlControllerProfile(tag, profile))
+      {
+        FailManagedSession("The matchmaking ticket contains an invalid controller profile");
+        m_managed_session.reset();
+        return;
+      }
+      m_managed_session->controller_tags[parsed_seat] = tag;
+      m_managed_session->controller_profiles[parsed_seat] = profile;
     }
     if (id != player.end() && id->second.is<std::string>() &&
         id->second.get<std::string>() == *player_id && name != player.end() &&
@@ -2213,14 +2413,14 @@ void MainWindow::StartManagedNetPlay()
   Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_DIRECTORY, replay_output_path.value_or(""));
 
   const bool valid_player_count =
-      m_managed_session->player_count >= 2 && m_managed_session->player_count <= 4 &&
+      m_managed_session->player_count >= 1 && m_managed_session->player_count <= 4 &&
       m_managed_session->seat >= 1 && m_managed_session->seat <= m_managed_session->player_count;
-  const bool valid_test_solo = m_managed_session->test_solo &&
-                               m_managed_session->player_count == 1 && m_managed_session->seat == 1;
+  const bool ticket_solo_matches_roster =
+      m_managed_session->test_solo == (m_managed_session->player_count == 1);
   const bool complete_roster =
       std::all_of(m_managed_session->player_ids.begin() + 1, m_managed_session->player_ids.end(),
                   [](const std::string& id) { return !id.empty(); });
-  if ((!valid_player_count && !valid_test_solo) || !complete_roster ||
+  if (!valid_player_count || !ticket_solo_matches_roster || !complete_roster ||
       m_managed_session->display_name.empty())
   {
     FailManagedSession("The matchmaking ticket contains an invalid player roster");
@@ -2228,7 +2428,7 @@ void MainWindow::StartManagedNetPlay()
     return;
   }
   if ((m_managed_session->simulate_remote_p2 || m_managed_session->native_stress) &&
-      !valid_test_solo)
+      (m_managed_session->player_count != 1 || m_managed_session->seat != 1))
   {
     FailManagedSession("Solo rollback diagnostics require a one-player test ticket");
     m_managed_session.reset();
@@ -2241,6 +2441,12 @@ void MainWindow::StartManagedNetPlay()
     m_managed_session.reset();
     return;
   }
+  if (m_managed_session->stress_test && !m_managed_session->rollback_window_override)
+  {
+    FailManagedSession("Rollback stress requires an explicit rollback-window override");
+    m_managed_session.reset();
+    return;
+  }
 
   std::string game_path;
   std::optional<std::string> sd_card_path;
@@ -2248,6 +2454,12 @@ void MainWindow::StartManagedNetPlay()
   {
     const UICommon::GameFile brawl_iso(m_managed_session->brawl_iso_path);
     const std::string& brawl_game_id = brawl_iso.GetGameID();
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Managed launch: Project+ Brawl ISO path='{}', exists={}, valid={}, "
+                   "game_id='{}', revision={}",
+                   m_managed_session->brawl_iso_path,
+                   File::Exists(m_managed_session->brawl_iso_path), brawl_iso.IsValid(),
+                   brawl_game_id, brawl_iso.GetRevision());
     if (!brawl_iso.IsValid() || (brawl_game_id != "RSBE01" && brawl_game_id != "RSBP01" &&
                                  brawl_game_id != "RSBJ01" && brawl_game_id != "RSBK01"))
     {
@@ -2258,6 +2470,11 @@ void MainWindow::StartManagedNetPlay()
     Config::SetCurrent(Config::MAIN_DEFAULT_ISO, m_managed_session->brawl_iso_path);
     Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME, "Project+");
     game_path = File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "Project+ Netplay Launcher.dol";
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Managed launch: Project+ launcher path='{}', exists={}; SD path='{}', "
+                   "exists={}",
+                   game_path, File::Exists(game_path), m_managed_session->project_plus_sd_path,
+                   File::Exists(m_managed_session->project_plus_sd_path));
     if (m_managed_session->project_plus_sd_path.empty() ||
         !File::Exists(m_managed_session->project_plus_sd_path))
     {
@@ -2271,6 +2488,12 @@ void MainWindow::StartManagedNetPlay()
   {
     const UICommon::GameFile brawl_iso(m_managed_session->brawl_iso_path);
     const std::string& brawl_game_id = brawl_iso.GetGameID();
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Managed launch: Brawl ISO path='{}', exists={}, valid={}, game_id='{}', "
+                   "revision={}",
+                   m_managed_session->brawl_iso_path,
+                   File::Exists(m_managed_session->brawl_iso_path), brawl_iso.IsValid(),
+                   brawl_game_id, brawl_iso.GetRevision());
     if (!brawl_iso.IsValid() || (brawl_game_id != "RSBE01" && brawl_game_id != "RSBP01" &&
                                  brawl_game_id != "RSBJ01" && brawl_game_id != "RSBK01"))
     {
@@ -2280,11 +2503,26 @@ void MainWindow::StartManagedNetPlay()
     }
     Config::SetCurrent(Config::MAIN_DEFAULT_ISO, m_managed_session->brawl_iso_path);
     Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME, "Brawl");
-    game_path = m_managed_session->brawl_iso_path;
+    game_path =
+        File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "vBrawl Netplay Launcher.dol";
+    if (m_managed_session->sd_card_path.empty() ||
+        !File::Exists(m_managed_session->sd_card_path))
+    {
+      FailManagedSession("The bundled vBrawl SD card is missing");
+      m_managed_session.reset();
+      return;
+    }
+    sd_card_path = m_managed_session->sd_card_path;
   }
   else if (m_managed_session->game.rfind("dolphin:", 0) == 0)
   {
     const UICommon::GameFile custom_game(m_managed_session->game_path);
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Managed launch: custom game path='{}', exists={}, valid={}, game_id='{}', "
+                   "revision={} (expected game_id='{}', revision={})",
+                   m_managed_session->game_path, File::Exists(m_managed_session->game_path),
+                   custom_game.IsValid(), custom_game.GetGameID(), custom_game.GetRevision(),
+                   m_managed_session->game_id, m_managed_session->game_revision);
     if (!custom_game.IsValid() || custom_game.GetGameID() != m_managed_session->game_id ||
         custom_game.GetRevision() != m_managed_session->game_revision)
     {
@@ -2295,6 +2533,16 @@ void MainWindow::StartManagedNetPlay()
     Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME,
                        custom_game.GetName(UICommon::GameFile::Variant::LongAndPossiblyCustom));
     game_path = m_managed_session->game_path;
+    if (!m_managed_session->sd_card_path.empty())
+    {
+      if (!File::Exists(m_managed_session->sd_card_path))
+      {
+        FailManagedSession("The configured custom-game SD card is missing");
+        m_managed_session.reset();
+        return;
+      }
+      sd_card_path = m_managed_session->sd_card_path;
+    }
   }
   else
   {
@@ -2304,11 +2552,19 @@ void MainWindow::StartManagedNetPlay()
   }
 
   const UICommon::GameFile selected_game(game_path);
-  if (!selected_game.IsValid() || !m_netplay_dialog->SetManagedGamePath(game_path))
+  const bool selected_game_valid = selected_game.IsValid();
+  const bool selected_game_registered =
+      selected_game_valid && m_netplay_dialog->SetManagedGamePath(game_path);
+  NOTICE_LOG_FMT(NETPLAY,
+                 "Managed launch: selected game path='{}', exists={}, valid={}, game_id='{}', "
+                 "revision={}, registered={}",
+                 game_path, File::Exists(game_path), selected_game_valid, selected_game.GetGameID(),
+                 selected_game.GetRevision(), selected_game_registered);
+  if (!selected_game_valid || !selected_game_registered)
   {
     const QString detail =
         m_managed_session->game == "brawl" ?
-            tr("The selected Brawl ISO could not be opened.") :
+            tr("vBrawl Netplay Launcher.dol was not found in this Dolphin user folder.") :
         m_managed_session->game == "project-plus" ?
             tr("Project+ Netplay Launcher.dol was not found in this Dolphin user folder.") :
             tr("The selected custom game could not be opened.");
@@ -2320,8 +2576,26 @@ void MainWindow::StartManagedNetPlay()
   Config::SetCurrent(Config::MAIN_WII_SD_CARD, sd_card_path.has_value());
   Config::SetCurrent(Config::MAIN_WII_SD_CARD_ENABLE_FOLDER_SYNC, false);
   Config::SetCurrent(Config::MAIN_WII_SD_CARD_IMAGE_PATH, sd_card_path.value_or(""));
+  const bool has_managed_gecko_codes = !m_managed_session->gecko_codes_path.empty();
+  Config::SetCurrent(Config::NETPLAY_SYNC_CODES, true);
+  if (has_managed_gecko_codes)
+    Config::SetCurrent(Config::MAIN_ENABLE_CHEATS, true);
   File::SetUserPath(F_WIISDCARDIMAGE_IDX, sd_card_path.value_or(""));
 
+  if (!m_managed_session->wii_save_data_bin_path.empty() &&
+      WiiSave::ImportForNetplay(m_managed_session->wii_save_data_bin_path,
+                                selected_game.GetTitleID()) != WiiSave::CopyResult::Success)
+  {
+    FailManagedSession("The configured Wii data.bin save is invalid or belongs to another game");
+    m_managed_session.reset();
+    return;
+  }
+
+  NOTICE_LOG_FMT(NETPLAY,
+                 "Managed launch: validation complete (game='{}', seat={}, players={}, "
+                 "sd_enabled={}, managed_gecko_codes={})",
+                 m_managed_session->game, m_managed_session->seat, m_managed_session->player_count,
+                 sd_card_path.has_value(), !m_managed_session->gecko_codes_path.empty());
   ReportManagedStatus("connecting");
 
   if (m_managed_session->seat == 1)
@@ -2336,6 +2610,7 @@ void MainWindow::StartManagedNetPlay()
       return;
     }
     server->SetManagedPlayers(m_managed_session->match_id, m_managed_session->player_ids);
+    server->SetManagedGeckoCodesPath(m_managed_session->gecko_codes_path);
     server->ChangeGame(selected_game.GetSyncIdentifier(),
                        m_game_list->GetNetPlayName(selected_game));
   }
@@ -2346,6 +2621,9 @@ void MainWindow::StartManagedNetPlay()
     m_managed_session.reset();
     return;
   }
+
+  NOTICE_LOG_FMT(NETPLAY, "Managed launch: NetPlay client joined (seat={})",
+                 m_managed_session->seat);
 
   if (m_managed_session->seat == 1)
     QTimer::singleShot(100, this, &MainWindow::PollManagedNetPlayReady);
@@ -2361,26 +2639,43 @@ void MainWindow::PollManagedNetPlayReady()
   const auto client = Settings::Instance().GetNetPlayClient();
   const auto server = Settings::Instance().GetNetPlayServer();
   if (!client || !server)
-    return;
-
-  if (static_cast<int>(client->GetPlayers().size()) == m_managed_session->player_count &&
-      client->DoAllPlayersHaveGame())
   {
-    if (!m_managed_session->test_solo && !m_managed_session->latency_sampling_started)
+    ERROR_LOG_FMT(NETPLAY, "Managed launch: readiness polling lost {}{}", client ? "" : "client",
+                  !client && !server ? " and server" :
+                  !server            ? "server" :
+                                       "");
+    return;
+  }
+
+  ++m_managed_session->ready_poll_count;
+  const size_t connected_players = client->GetPlayers().size();
+  const bool all_players_have_game = client->DoAllPlayersHaveGame();
+  if (m_managed_session->ready_poll_count == 1 || m_managed_session->ready_poll_count % 50 == 0)
+  {
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Managed launch: waiting for lobby readiness (connected={}/{}, "
+                   "all_have_game={})",
+                   connected_players, m_managed_session->player_count, all_players_have_game);
+  }
+
+  if (static_cast<int>(connected_players) == m_managed_session->player_count &&
+      all_players_have_game)
+  {
+    if (!m_managed_session->latency_sampling_started)
     {
       // NetPlay publishes its first RTT sample once per second. Do not derive the session delay
       // from the initial zero-valued player records.
       m_managed_session->latency_sampling_started = true;
+      NOTICE_LOG_FMT(NETPLAY, "Managed launch: lobby ready; waiting for the first latency sample");
       QTimer::singleShot(1250, this, &MainWindow::PollManagedNetPlayReady);
       return;
     }
 
-    unsigned int rollback_window = m_managed_session->rollback_window_override.value_or(
-        m_managed_session->test_solo || m_managed_session->stress_test ? 2 : 5);
+    unsigned int rollback_window = m_managed_session->rollback_window_override.value_or(5);
     const u32 ping = client->GetPlayersMaxPing();
     const u32 delay =
         NetPlay::GetGekkoInputDelayForPing(ping, m_managed_session->input_delay_reduction);
-    if (!m_managed_session->test_solo && !m_managed_session->stress_test)
+    if (!m_managed_session->stress_test)
     {
       // Both the selected preset and the ping are session-wide for managed matchmaking. Expand the
       // shared prediction window only when the negotiated delay does not cover this round trip.
@@ -2391,16 +2686,19 @@ void MainWindow::PollManagedNetPlayReady()
       }
     }
     server->AdjustMinimumPadBufferSize(rollback_window);
-    server->SetManagedGekkoPing(ping);
+    const u32 local_delay = m_managed_session->input_delay_override.value_or(delay);
+    client->AdjustPlayerPadBufferSize(local_delay);
+    if (!m_managed_session->input_delay_override)
+      server->SetManagedGekkoPing(ping);
 
-    INFO_LOG_FMT(NETPLAY,
-                 "Managed session latency settings: ping={} ms, host_input_delay={}, "
-                 "input_delay_mode={}, rollback_window={}{}",
-                 ping, m_managed_session->input_delay_override.value_or(delay),
-                 m_managed_session->input_delay_mode, rollback_window,
-                 m_managed_session->input_delay_override ? " (local stress override)" : "");
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Managed session latency settings: ping={} ms, host_input_delay={}, "
+                   "input_delay_mode={}, rollback_window={}{}",
+                   ping, local_delay, m_managed_session->input_delay_mode, rollback_window,
+                   m_managed_session->input_delay_override ? " (local override)" : "");
 
     m_managed_session->start_requested = true;
+    NOTICE_LOG_FMT(NETPLAY, "Managed launch: requesting synchronized game start");
     if (!server->RequestStartGame())
     {
       FailManagedSession("The synchronized game start failed");
@@ -2468,6 +2766,7 @@ bool MainWindow::NetPlayJoin()
   if (is_managed)
   {
     managed_config.emplace();
+    managed_config->game_name = m_managed_session->game;
     managed_config->rendezvous_address = m_managed_session->rendezvous_address;
     managed_config->match_id = m_managed_session->match_id;
     managed_config->player_id = m_managed_session->player_id;
@@ -2477,15 +2776,39 @@ bool MainWindow::NetPlayJoin()
     managed_config->coordinator = m_managed_session->seat == 1;
     managed_config->input_delay_reduction = m_managed_session->input_delay_reduction;
     managed_config->auto_input_delay = !m_managed_session->input_delay_override.has_value();
+    managed_config->controller_types.reserve(m_managed_session->player_count);
+    for (int seat = 1; seat <= m_managed_session->player_count; ++seat)
+    {
+      managed_config->controller_types.push_back(m_managed_session->game_platform == 0 ?
+                                                     Rollback::ControllerType::GameCube :
+                                                     static_cast<Rollback::ControllerType>(
+                                                         m_managed_session->controller_types[seat]));
+    }
     auto& rollback_options = managed_config->rollback_options;
+    rollback_options.controller_types = managed_config->controller_types;
+    rollback_options.brawl_controller_profiles.reserve(m_managed_session->player_count);
+    for (int seat = 1; seat <= m_managed_session->player_count; ++seat)
+    {
+      rollback_options.brawl_controller_profiles.push_back(
+          *Rollback::ParseBrawlControllerProfile(m_managed_session->controller_tags[seat],
+                                                  m_managed_session->controller_profiles[seat]));
+      if (!m_managed_session->controller_tags[seat].empty())
+      {
+        NOTICE_LOG_FMT(NETPLAY,
+                       "Managed controller profile: P{} tag='{}' payload_bytes={}", seat,
+                       m_managed_session->controller_tags[seat],
+                       m_managed_session->controller_profiles[seat].size() / 2);
+      }
+    }
     rollback_options.simulate_remote_p2 = m_managed_session->simulate_remote_p2;
     rollback_options.stress_test = m_managed_session->stress_test;
     rollback_options.enable_random_inputs = m_managed_session->enable_random_inputs;
-    rollback_options.disable_project_plus_music =
-        m_managed_session->disable_project_plus_music;
+    rollback_options.disable_project_plus_music = m_managed_session->disable_project_plus_music;
     rollback_options.native_stress = m_managed_session->native_stress;
     rollback_options.stress_interval = m_managed_session->stress_interval;
     rollback_options.compare_confirmed_ram = m_managed_session->compare_confirmed_ram;
+    rollback_options.remote_ram_match = m_managed_session->remote_ram_match;
+    rollback_options.compare_confirmed_video = m_managed_session->compare_confirmed_video;
     rollback_options.stop_ram_compare_on_mismatch = m_managed_session->stop_ram_compare_on_mismatch;
     rollback_options.deep_logging = m_managed_session->deep_logging;
     rollback_options.coarse_fifo_timing = m_managed_session->coarse_fifo_timing;
@@ -2496,6 +2819,7 @@ bool MainWindow::NetPlayJoin()
     rollback_options.full_scan_benchmark = m_managed_session->full_scan_benchmark;
     rollback_options.full_scan_keep_tracking = m_managed_session->full_scan_keep_tracking;
     rollback_options.parallel_dirty_compare = m_managed_session->parallel_dirty_compare;
+    rollback_options.replay_input_path = m_managed_session->replay_input_path;
   }
   Settings::Instance().ResetNetPlayClient(new NetPlay::NetPlayClient(
       host_ip, host_port, m_netplay_dialog, nickname,
@@ -2602,6 +2926,25 @@ bool MainWindow::eventFilter(QObject* object, QEvent* event)
 {
   if (event->type() == QEvent::Close)
   {
+    // A managed Brawlback process belongs to one match. Closing either its main window or render
+    // window means exiting that process, not asking the emulated Wii to shut down gracefully.
+    // In particular, do not leave fullscreen here: an exclusive-fullscreen surface transition can
+    // wait on the GPU thread while the graceful STM path waits on the CPU thread.
+    if (m_managed_session && !Core::IsUninitialized(m_system))
+    {
+      static_cast<QCloseEvent*>(event)->ignore();
+
+      if (!m_exit_requested)
+      {
+        NOTICE_LOG_FMT(CORE,
+                       "Shutdown lifecycle: managed window close requested; bypassing fullscreen "
+                       "and guest STM shutdown and forcing process exit");
+        ForceManagedProcessExit(true);
+      }
+
+      return true;
+    }
+
     if (RequestStop() && object == this)
       m_exit_requested = true;
 
@@ -2820,6 +3163,12 @@ void MainWindow::OnStartRecording()
 
 void MainWindow::OnStopRecording()
 {
+  NOTICE_LOG_FMT(NETPLAY,
+                 "Shutdown lifecycle: OnStopRecording entered "
+                 "(managed_npr_recording={}, npr_playback={}, dtm_recording={}, dtm_active={})",
+                 m_managed_session && m_managed_session->netplay_replay_recording_started,
+                 Rollback::IsNetplayReplayPlaying(), m_system.GetMovie().IsRecordingInput(),
+                 m_system.GetMovie().IsMovieActive());
   if (m_managed_session && m_managed_session->netplay_replay_recording_started)
   {
     bool saved = false;
@@ -2841,6 +3190,7 @@ void MainWindow::OnStopRecording()
     Rollback::StopNetplayReplay();
     m_managed_session->netplay_replay_recording_started = false;
     emit RecordingStatusChanged(false);
+    NOTICE_LOG_FMT(NETPLAY, "Shutdown lifecycle: managed NPR recording stopped (saved={})", saved);
     return;
   }
 
@@ -2853,6 +3203,7 @@ void MainWindow::OnStopRecording()
   if (movie.IsMovieActive())
     movie.EndPlayInput(false);
   emit RecordingStatusChanged(false);
+  NOTICE_LOG_FMT(NETPLAY, "Shutdown lifecycle: OnStopRecording completed");
 }
 
 void MainWindow::OnExportRecording()

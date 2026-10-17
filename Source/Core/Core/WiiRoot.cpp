@@ -3,6 +3,7 @@
 
 #include "Core/WiiRoot.h"
 
+#include <algorithm>
 #include <optional>
 #include <filesystem>
 #include <string>
@@ -149,6 +150,50 @@ static bool CopyNandFile(FS::FileSystem* source_fs, const std::string& source_fi
   return true;
 }
 
+static bool InstallBrawlControllerProfiles(
+    FS::FileSystem* session_fs,
+    const std::vector<Rollback::BrawlControllerProfile>& profiles)
+{
+  if (std::none_of(profiles.begin(), profiles.end(),
+                   [](const auto& profile) { return profile.Enabled(); }))
+  {
+    return true;
+  }
+
+  constexpr u64 BRAWL_TITLE_ID = 0x0001000052534245;
+  const std::string save_directory = Common::GetTitleDataPath(BRAWL_TITLE_ID);
+  const std::string primary_path = save_directory + "/autosv0.bin";
+  const auto primary = session_fs->OpenFile(IOS::PID_KERNEL, IOS::PID_KERNEL, primary_path,
+                                            FS::Mode::Read);
+  if (!primary)
+    return false;
+
+  const auto status = primary->GetStatus();
+  if (!status)
+    return false;
+  std::vector<u8> save(status->size);
+  if (!primary->Read(save.data(), save.size()) ||
+      !Rollback::ApplyBrawlControllerProfilesToSave(&save, profiles))
+  {
+    return false;
+  }
+
+  for (const std::string_view name : {"autosv0.bin", "autosv1.bin"})
+  {
+    const std::string path = save_directory + '/' + std::string(name);
+    const auto file = session_fs->OpenFile(IOS::PID_KERNEL, IOS::PID_KERNEL, path,
+                                           FS::Mode::ReadWrite);
+    if (!file || !file->Seek(0, FS::SeekMode::Set) || !file->Write(save.data(), save.size()))
+      return false;
+  }
+
+  NOTICE_LOG_FMT(CORE,
+                 "Wii Save Init: installed {} synchronized Brawl controller tag profile(s)",
+                 std::count_if(profiles.begin(), profiles.end(),
+                               [](const auto& profile) { return profile.Enabled(); }));
+  return true;
+}
+
 static void InitializeDeterministicWiiSaves(FS::FileSystem* session_fs,
                                             const BootSessionData& boot_session_data)
 {
@@ -156,8 +201,9 @@ static void InitializeDeterministicWiiSaves(FS::FileSystem* session_fs,
   // Replay playback is loaded before the emulated boot begins. Use its authoritative runtime
   // state as well as the boot marker so every boot path receives the same deterministic Wii-save
   // initialization as the session that produced the input stream.
-  const bool netplay_replay =
-      boot_session_data.IsNetplayReplay() || Rollback::IsNetplayReplayPlaying();
+  const bool netplay_replay = boot_session_data.IsNetplayReplay() ||
+                              Rollback::IsNetplayReplayPlaying() ||
+                              Rollback::IsNetplayReplayInputActive();
   const u64 title_id = SConfig::GetInstance().GetTitleID();
   const auto configured_fs = FS::MakeFileSystem(FS::Location::Configured);
   if (movie.IsRecordingInput())
@@ -212,6 +258,13 @@ static void InitializeDeterministicWiiSaves(FS::FileSystem* session_fs,
         INFO_LOG_FMT(CORE, "Wii Save Init: Copying {0:016x}.", title);
         copy_save(title);
       }
+    }
+
+    if (!InstallBrawlControllerProfiles(session_fs,
+                                        boot_session_data.GetBrawlControllerProfiles()))
+    {
+      ERROR_LOG_FMT(CORE,
+                    "Wii Save Init: failed to install synchronized Brawl controller profiles");
     }
 
     // Copy Mii data
@@ -486,13 +539,14 @@ void InitializeWiiFileSystemContents(
     }
 
     InitializeDeterministicWiiSaves(fs.get(), boot_session_data);
-    if (boot_session_data.IsNetplayReplay() || Rollback::IsNetplayReplayPlaying())
+    if (boot_session_data.IsNetplayReplay() || Rollback::IsNetplayReplayPlaying() ||
+        Rollback::IsNetplayReplayInputActive())
     {
       const std::vector<u8> replay_sysconf = Rollback::GetNetplayReplaySysconf();
       if (!replay_sysconf.empty())
       {
-        const auto file = fs->OpenFile(IOS::PID_KERNEL, IOS::PID_KERNEL,
-                                       "/shared2/sys/SYSCONF", FS::Mode::ReadWrite);
+        const auto file = fs->OpenFile(IOS::PID_KERNEL, IOS::PID_KERNEL, "/shared2/sys/SYSCONF",
+                                       FS::Mode::ReadWrite);
         if (!file || !file->Seek(0, FS::SeekMode::Set) ||
             !file->Write(replay_sysconf.data(), replay_sysconf.size()))
         {

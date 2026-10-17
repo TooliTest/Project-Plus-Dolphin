@@ -871,9 +871,13 @@ void NetPlayDialog::BootGame(const std::string& filename,
 void NetPlayDialog::StopGame()
 {
   if (m_got_stop_request)
+  {
+    NOTICE_LOG_FMT(NETPLAY, "Shutdown lifecycle: NetPlayDialog ignored duplicate StopGame request");
     return;
+  }
 
   m_got_stop_request = true;
+  NOTICE_LOG_FMT(NETPLAY, "Shutdown lifecycle: NetPlayDialog emitting forced Stop signal");
   emit Stop();
 }
 
@@ -896,8 +900,7 @@ void NetPlayDialog::DisplayMessage(const QString& msg, const std::string& color,
 
   const QColor c(color.empty() ? QStringLiteral("white") : QString::fromStdString(color));
 
-  if (Config::Get(Config::GFX_SHOW_NETPLAY_MESSAGES) &&
-      Core::IsRunning(Core::System::GetInstance()))
+  if (g_netplay_chat_ui && Core::IsRunning(Core::System::GetInstance()))
   {
     g_netplay_chat_ui->AppendChat(msg.toStdString(),
                                   {static_cast<float>(c.redF()), static_cast<float>(c.greenF()),
@@ -977,8 +980,8 @@ void NetPlayDialog::OnMsgStartGame()
 {
   DisplayMessage(tr("Started game"), "green");
 
-  g_netplay_chat_ui =
-      std::make_unique<NetPlayChatUI>([this](const std::string& message) { SendMessage(message); });
+  g_netplay_chat_ui = std::make_unique<NetPlayChatUI>(
+      m_nickname, [this](const std::string& message) { SendMessage(message); });
 
   if (m_host_input_authority && Settings::Instance().GetNetPlayClient()->GetNetSettings().golf_mode)
   {
@@ -1013,8 +1016,13 @@ void NetPlayDialog::OnMsgStopGame()
 void NetPlayDialog::OnMsgPowerButton()
 {
   if (!Core::IsRunning(Core::System::GetInstance()))
+  {
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Shutdown lifecycle: NetPlay power-button UI request ignored; core not running");
     return;
-  QueueOnObject(this, [] { UICommon::TriggerSTMPowerEvent(); });
+  }
+  NOTICE_LOG_FMT(NETPLAY, "Shutdown lifecycle: forwarding NetPlay power event to main window");
+  emit PowerButtonReceived();
 }
 
 void NetPlayDialog::OnPlayerConnect(const std::string& player)
@@ -1257,7 +1265,7 @@ void NetPlayDialog::LoadSettings()
   m_player_buffer_size_box->setValue(player_buffer_size);
   const int frame_boundary_index =
       m_frame_boundary_combo->findData(static_cast<int>(rollback_frame_boundary));
-  const int default_frame_boundary_index = m_frame_boundary_combo->findData(1);
+  const int default_frame_boundary_index = m_frame_boundary_combo->findData(2);
   m_frame_boundary_combo->setCurrentIndex(frame_boundary_index >= 0 ? frame_boundary_index :
                                                                       default_frame_boundary_index);
 

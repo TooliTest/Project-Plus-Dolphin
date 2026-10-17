@@ -108,6 +108,7 @@ private:
 
   // May ask for confirmation. Returns whether or not it actually stopped.
   bool RequestStop();
+  void ForceManagedProcessExit(bool notify_peers);
   void ForceStop();
   void Reset();
   void FrameAdvance();
@@ -281,15 +282,21 @@ private:
     std::string game;
     std::string brawl_iso_path;
     std::string project_plus_sd_path;
+    std::string sd_card_path;
     std::string game_path;
     std::string game_id;
     u16 game_revision = 0;
+    u8 game_platform = 2;
     std::string status_path;
     std::string replay_output_path;
+    std::string replay_input_path;
     int seat = 0;
     int player_count = 0;
     std::vector<std::string> player_ids;
     std::vector<std::string> player_names;
+    std::vector<u8> controller_types;
+    std::vector<std::string> controller_tags;
+    std::vector<std::string> controller_profiles;
     bool test_solo = false;
     bool stress_test = false;
     bool simulate_remote_p2 = false;
@@ -298,15 +305,19 @@ private:
     bool native_stress = false;
     u32 stress_interval = 1;
     std::optional<u32> rollback_window_override;
-    u32 frame_boundary = 1;
+    u32 frame_boundary = 2;
+    std::string gecko_codes_path;
+    std::string wii_save_data_bin_path;
     bool full_scan_benchmark = false;
     bool full_scan_keep_tracking = false;
-    bool parallel_dirty_compare = false;
+    bool parallel_dirty_compare = true;
     bool tracked_bitmap_clear = true;
     std::optional<u32> input_delay_override;
     u32 input_delay_reduction = 2;
     std::string input_delay_mode = "safe";
     bool compare_confirmed_ram = false;
+    bool remote_ram_match = false;
+    bool compare_confirmed_video = false;
     bool stop_ram_compare_on_mismatch = false;
     bool deep_logging = false;
     bool enable_netplay_replays = false;
@@ -314,6 +325,7 @@ private:
     bool coarse_fifo_timing = false;
     bool late_vi_guard = true;
     bool latency_sampling_started = false;
+    u32 ready_poll_count = 0;
     bool start_requested = false;
     bool started_reported = false;
     bool failure_reported = false;

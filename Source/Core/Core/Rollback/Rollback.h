@@ -24,6 +24,7 @@
 #include "Common/CommonTypes.h"
 #include "Core/State.h"
 #include "InputCommon/GCPadStatus.h"
+#include "VideoCommon/FramebufferManager.h"
 
 namespace Core
 {
@@ -69,12 +70,27 @@ struct ResimGuestHotspot
   u64 slices = 0;
 };
 
+enum class ResimJitMemoryRegion : u8
+{
+  Ram,
+  GatherPipe,
+  Mmio,
+  Other,
+  Count,
+};
+
 struct ResimJitMemoryStats
 {
   u64 read_calls = 0;
   u64 read_nanoseconds = 0;
   u64 write_calls = 0;
   u64 write_nanoseconds = 0;
+  std::array<u64, static_cast<std::size_t>(ResimJitMemoryRegion::Count)> read_region_calls{};
+  std::array<u64, static_cast<std::size_t>(ResimJitMemoryRegion::Count)>
+      read_region_nanoseconds{};
+  std::array<u64, static_cast<std::size_t>(ResimJitMemoryRegion::Count)> write_region_calls{};
+  std::array<u64, static_cast<std::size_t>(ResimJitMemoryRegion::Count)>
+      write_region_nanoseconds{};
 };
 
 enum class ResimEventCategory : u8
@@ -144,7 +160,7 @@ void RecordResimJitCompile(u64 nanoseconds);
 ResimJitCompileStats GetResimJitCompileStats();
 void RecordResimGuestSlice(u32 pc, u64 nanoseconds, u64 cycles);
 std::vector<ResimGuestHotspot> TakeResimGuestHotspots(std::size_t limit);
-void RecordResimJitMemoryHelper(bool write, u64 nanoseconds);
+void RecordResimJitMemoryHelper(bool write, ResimJitMemoryRegion region, u64 nanoseconds);
 ResimJitMemoryStats TakeResimJitMemoryStats();
 void RecordResimEvent(ResimEventCategory category, u64 nanoseconds);
 ResimEventStats GetResimEventStats();
@@ -152,8 +168,7 @@ void RecordRollbackBurst(u64 duration_ns, u64 load_ns, u64 exec_ns, u64 save_ns,
                          u32 replay_frames);
 RollbackBurstMarker GetLastRollbackBurst();
 void RecordFramePacingBoundary(s32 gekko_frame, bool follows_rollback);
-void RecordFramePacingThrottle(u64 start_time_ns, u64 end_time_ns, u64 requested_ns,
-                               u64 actual_ns);
+void RecordFramePacingThrottle(u64 start_time_ns, u64 end_time_ns, u64 requested_ns, u64 actual_ns);
 FramePacingMarker GetLastFramePacingMarker();
 
 // Holds InSnapshotDoState() true for its lifetime.
@@ -182,7 +197,8 @@ class SnapshotRing
 public:
   explicit SnapshotRing(std::size_t slots, bool tracked_bitmap_clear = false,
                         bool force_full_scan = false, bool keep_jit_tracking = false,
-                        bool audit_untracked_writes = false);
+                        bool audit_untracked_writes = false, bool audit_video = false,
+                        bool trace_snapshots = false);
   ~SnapshotRing();
   SnapshotRing(const SnapshotRing&) = delete;
   SnapshotRing& operator=(const SnapshotRing&) = delete;
@@ -194,10 +210,13 @@ public:
   // would run the boundary twice.
   bool Load(Core::System& system, s64 frame);
   bool Has(s64 frame) const;
+  // Expands diagnostic history without invalidating existing snapshots. Shrinking is unsupported.
+  void ExpandSlots(std::size_t slots);
   // Serialized non-RAM state from the most recent Save, for determinism diagnostics.
   std::span<const u8> LastState() const;
   const State::RollbackStateLayout& LastStateLayout() const;
   std::span<const u8> StateForFrame(s64 frame) const;
+  const EFBRollbackAuditCapture* EFBAuditForFrame(s64 frame) const;
   std::optional<u64> NandJournalMarkForFrame(s64 frame) const;
   const SnapshotPhaseTimings& GetLastSaveTimings() const { return m_last_save_timings; }
   const SnapshotPhaseTimings& GetLastLoadTimings() const { return m_last_load_timings; }
@@ -222,6 +241,7 @@ private:
     std::vector<u8> l1_cache;
     std::vector<u64> audit_mem1_pages;
     std::vector<u64> audit_mem2_pages;
+    EFBRollbackAuditCapture audit_efb;
     Common::UniqueBuffer<u8> state;
     std::size_t state_size = 0;
     State::RollbackStateLayout state_layout;
@@ -252,11 +272,17 @@ private:
   std::vector<u64> m_replay_mem1_audit;
   std::vector<u64> m_replay_mem2_audit;
   bool m_replay_mismatch_reported = false;
+  bool m_state_byte_details_reported = false;
+  bool m_efb_mismatch_reported = false;
+  bool m_efb_match_reported = false;
+  EFBRollbackAuditCapture m_efb_audit_scratch;
   std::optional<bool> m_dirty_page_tracking;
   const bool m_tracked_bitmap_clear;
   const bool m_force_full_scan;
   const bool m_keep_jit_tracking;
   const bool m_audit_untracked_writes;
+  const bool m_audit_video;
+  const bool m_trace_snapshots;
   SnapshotPhaseTimings m_last_save_timings;
   SnapshotPhaseTimings m_last_load_timings;
   u32 m_initial_trace_events = 0;
