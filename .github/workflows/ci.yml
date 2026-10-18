@@ -19,7 +19,7 @@ jobs:
     - name: Checkout Upstream Repo
       uses: actions/checkout@v4
       with:
-        repository: TooliTest/Project-Plus-Dolphin
+        repository: NyxTheShield/Project-Plus-Dolphin
         ref: master
         fetch-depth: 0
         fetch-tags: true
@@ -27,6 +27,12 @@ jobs:
     - name: Checkout Submodules
       if: steps.cache-submodules.outputs.cache-hit != 'true'
       run: git submodule update --init --recursive -j $(getconf _NPROCESSORS_ONLN)
+
+    - name: Replace Files
+      run: |
+        curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/Source/Core/DolphinQt/MainWindow.cpp -o ${{github.workspace}}/Source/Core/DolphinQt/MainWindow.cpp
+        curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/Externals/GekkoNet/CMakeLists.txt -o ${{github.workspace}}/Externals/GekkoNet/CMakeLists.txt
+      shell: bash
 
     - name: Set Version
       run: |
@@ -90,11 +96,6 @@ jobs:
         cd build
         cmake .. -GNinja -DCMAKE_C_COMPILER=/usr/lib/ccache/gcc-13 -DCMAKE_CXX_COMPILER=/usr/lib/ccache/g++-13 -DCMAKE_PREFIX_PATH="${{github.workspace}}/qt/${{ env.yaqti }}/gcc_64/" -Ddatadir:PATH="share/project-plus-dolphin" -DBIN_INSTALL_DIR="install/usr/bin" -DCMAKE_INSTALL_PREFIX="install/usr" -DINC_INSTALL_DIR="install/usr/include" -DLIB_INSTALL_DIR="install/usr/lib" -DPKGCONFIG_INSTALL_DIR="install/usr/lib/pkgconfig" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_NOGUI=OFF
         ninja
-    - name: Upload Linux Build
-      uses: actions/upload-artifact@v4
-      with:
-        name: Project-Plus-Dolphin-Linux-${{ env.DOLPHINVER }}
-        path: build/
     - name: Install Dolphin
       run: |
         cd build
