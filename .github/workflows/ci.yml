@@ -32,6 +32,7 @@ jobs:
       run: |
         curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/Source/Core/DolphinQt/MainWindow.cpp -o ${{github.workspace}}/Source/Core/DolphinQt/MainWindow.cpp
         curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/Externals/GekkoNet/CMakeLists.txt -o ${{github.workspace}}/Externals/GekkoNet/CMakeLists.txt
+        curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/CMake/ScmRevGen.cmake -o ${{github.workspace}}/CMake/ScmRevGen.cmake
       shell: bash
 
     - name: Set Version
