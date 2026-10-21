@@ -55,6 +55,7 @@
 #include "Core/BootManager.h"
 #include "Core/CommonTitles.h"
 #include "Core/Config/AchievementSettings.h"
+#include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/NetplaySettings.h"
 #include "Core/Config/UISettings.h"
@@ -68,11 +69,12 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/SI/SI.h"
 #include "Core/HW/SI/SI_Device.h"
-#include "Core/HW/Wiimote.h"
 #include "Core/HW/WiiSave.h"
+#include "Core/HW/Wiimote.h"
 #include "Core/HotkeyManager.h"
 #include "Core/IOS/FS/FileSystem.h"
 #include "Core/IOS/USB/Bluetooth/BTEmu.h"
+#include "Core/ManagedLaunch/ManagedLaunchSchema.h"
 #include "Core/Movie.h"
 #include "Core/NetPlayClient.h"
 #include "Core/NetPlayProto.h"
@@ -1258,11 +1260,13 @@ void MainWindow::ForceManagedProcessExit(bool notify_peers)
   if (m_exit_requested)
     return;
 
-  NOTICE_LOG_FMT(CORE,
-                 "Shutdown lifecycle: forcing managed process exit (notify_peers={})",
+  NOTICE_LOG_FMT(CORE, "Shutdown lifecycle: forcing managed process exit (notify_peers={})",
                  notify_peers);
   m_exit_requested = true;
   m_stop_requested = true;
+
+  if (m_managed_session && !m_managed_session->failure_reported)
+    ReportManagedStatus("stopped");
 
   if (notify_peers && NetPlay::IsNetPlayRunning())
     NetPlay::SendPowerButtonEvent();
@@ -1881,10 +1885,22 @@ void MainWindow::ReportManagedStatus(const std::string& state, const std::string
   }
 
   picojson::object status;
+  status["schemaVersion"] = picojson::value(1.0);
   status["matchId"] = picojson::value(m_managed_session->match_id);
+  status["sequence"] = picojson::value(static_cast<double>(++m_managed_session->status_sequence));
   status["state"] = picojson::value(state);
   status["reason"] = picojson::value(reason);
-  if (!File::WriteStringToFile(m_managed_session->status_path, picojson::value(status).serialize()))
+  status["processId"] = picojson::value(static_cast<double>(QCoreApplication::applicationPid()));
+  if (state == "failed")
+    status["errorCode"] = picojson::value("managed_session_failed");
+  const std::string temporary_path = m_managed_session->status_path + ".tmp";
+  File::Delete(temporary_path);
+  const bool wrote_temporary =
+      File::WriteStringToFile(temporary_path, picojson::value(status).serialize());
+  // Readers may briefly observe no status file on Windows, but can never observe partial JSON.
+  const bool published = wrote_temporary && File::Delete(m_managed_session->status_path) &&
+                         File::Rename(temporary_path, m_managed_session->status_path);
+  if (!published)
   {
     ERROR_LOG_FMT(NETPLAY, "Managed launch could not write status '{}' to '{}'", state,
                   m_managed_session->status_path);
@@ -1959,9 +1975,23 @@ void MainWindow::StartManagedNetPlay()
     m_managed_session.reset();
     return;
   }
+
+  Core::ManagedLaunch::ParseResult parsed_ticket = Core::ManagedLaunch::ParseTicket(root);
+  if (!parsed_ticket)
+  {
+    ERROR_LOG_FMT(NETPLAY, "Managed launch: ticket validation failed: {}", parsed_ticket.error);
+    QTimer::singleShot(0, qApp, [] { QApplication::exit(1); });
+    m_managed_session.reset();
+    return;
+  }
+
+  NOTICE_LOG_FMT(NETPLAY, "Managed launch ticket (begin):\n{}\nManaged launch ticket (end)",
+                 Core::ManagedLaunch::FormatTicketForLog(root));
+
+  // A ticket is consumed only after the complete document has parsed and passed schema validation.
   File::Delete(ticket_path);
 
-  const picojson::object& ticket = root.get<picojson::object>();
+  const picojson::object& ticket = parsed_ticket.ticket->GetFields();
   const auto read_string = [&ticket](const char* name) -> std::optional<std::string> {
     const auto it = ticket.find(name);
     if (it == ticket.end() || !it->second.is<std::string>())
@@ -1983,6 +2013,75 @@ void MainWindow::StartManagedNetPlay()
   const auto replay_path = read_string("replay_path");
   const auto replay_output_path = read_string("replay_output_path");
   const auto replay_input_path = read_string("replay_input_path");
+  const auto session_fingerprint = read_string("session_fingerprint");
+  const auto gamecube_memory_card_path = read_string("gamecube_memory_card_path");
+  const auto wii_nand_path = read_string("wii_nand_path");
+
+  const auto save_replays_it = ticket.find("save_replays");
+  const auto start_fullscreen_it = ticket.find("start_fullscreen");
+  const auto disable_project_plus_music_it = ticket.find("disable_project_plus_music");
+  const bool save_replays = save_replays_it != ticket.end() && save_replays_it->second.is<bool>() &&
+                            save_replays_it->second.get<bool>();
+  const bool start_fullscreen = start_fullscreen_it != ticket.end() &&
+                                start_fullscreen_it->second.is<bool>() &&
+                                start_fullscreen_it->second.get<bool>();
+  const bool disable_project_plus_music =
+      disable_project_plus_music_it != ticket.end() &&
+      disable_project_plus_music_it->second.is<bool>() &&
+      disable_project_plus_music_it->second.get<bool>();
+  Config::SetCurrent(Config::MAIN_SAVE_NETPLAY_REPLAYS, save_replays);
+  Config::SetCurrent(Config::MAIN_FULLSCREEN, start_fullscreen);
+  if (gamecube_memory_card_path && !gamecube_memory_card_path->empty())
+    Config::SetCurrent(Config::MAIN_MEMCARD_A_PATH, *gamecube_memory_card_path);
+  if (wii_nand_path && !wii_nand_path->empty())
+  {
+    Config::SetCurrent(Config::MAIN_FS_PATH, *wii_nand_path);
+    File::SetUserPath(D_WIIROOT_IDX, *wii_nand_path);
+  }
+
+  const auto aspect_ratio_it = ticket.find("aspect_ratio");
+  const auto video_backend = read_string("video_backend");
+  const auto internal_resolution_it = ticket.find("internal_resolution");
+  const bool has_aspect_ratio =
+      aspect_ratio_it != ticket.end() && aspect_ratio_it->second.is<double>();
+  const bool has_internal_resolution =
+      internal_resolution_it != ticket.end() && internal_resolution_it->second.is<double>();
+  const double aspect_ratio = has_aspect_ratio ?
+                                  aspect_ratio_it->second.get<double>() :
+                                  static_cast<double>(Config::Get(Config::GFX_ASPECT_RATIO));
+  const double internal_resolution = has_internal_resolution ?
+                                         internal_resolution_it->second.get<double>() :
+                                         static_cast<double>(Config::Get(Config::GFX_EFB_SCALE));
+  const std::string selected_video_backend =
+      video_backend.value_or(Config::Get(Config::MAIN_GFX_BACKEND));
+  if ((aspect_ratio_it != ticket.end() && !has_aspect_ratio) ||
+      (internal_resolution_it != ticket.end() && !has_internal_resolution))
+  {
+    FailManagedSession("The managed graphics settings are invalid");
+    return;
+  }
+
+  if (aspect_ratio < 0.0 || aspect_ratio > 5.0 || internal_resolution < 1.0 ||
+      internal_resolution > 12.0 ||
+      (selected_video_backend != "D3D" && selected_video_backend != "D3D12" &&
+       selected_video_backend != "Vulkan" && selected_video_backend != "OGL"))
+  {
+    FailManagedSession("The managed graphics settings are invalid");
+    return;
+  }
+
+  m_managed_session->aspect_ratio = static_cast<u32>(aspect_ratio);
+  m_managed_session->video_backend = selected_video_backend;
+  m_managed_session->internal_resolution = static_cast<u32>(internal_resolution);
+  Config::SetCurrent(Config::GFX_ASPECT_RATIO,
+                     static_cast<AspectMode>(m_managed_session->aspect_ratio));
+  Config::SetCurrent(Config::MAIN_GFX_BACKEND, m_managed_session->video_backend);
+  Config::SetCurrent(Config::GFX_EFB_SCALE,
+                     static_cast<int>(m_managed_session->internal_resolution));
+  NOTICE_LOG_FMT(NETPLAY,
+                 "Managed launch graphics: backend={} internal_resolution={} aspect_ratio={}",
+                 m_managed_session->video_backend, m_managed_session->internal_resolution,
+                 m_managed_session->aspect_ratio);
 
   NOTICE_LOG_FMT(NETPLAY,
                  "Managed launch: ticket parsed (mode='{}', game='{}', match_id={}, player_id={}, "
@@ -2059,13 +2158,23 @@ void MainWindow::StartManagedNetPlay()
     Config::SetCurrent(Config::MAIN_WII_SD_CARD_IMAGE_PATH, sd_card_path.value_or(""));
     File::SetUserPath(F_WIISDCARDIMAGE_IDX, sd_card_path.value_or(""));
     const int replay_players = Rollback::GetNetplayReplayPlayerCount();
+    const std::vector<Rollback::ControllerType> replay_controller_types =
+        Rollback::GetNetplayReplayControllerTypes();
     for (int port = 0; port < SerialInterface::MAX_SI_CHANNELS; ++port)
     {
+      const bool has_player = port < replay_players &&
+                              port < static_cast<int>(replay_controller_types.size());
+      const bool is_gamecube =
+          has_player && replay_controller_types[port] == Rollback::ControllerType::GameCube;
+      const bool is_wiimote =
+          has_player && replay_controller_types[port] == Rollback::ControllerType::Wiimote;
       Config::SetCurrent(Config::GetInfoForSIDevice(port),
-                         port < replay_players ? SerialInterface::SIDEVICE_GC_CONTROLLER :
-                                                 SerialInterface::SIDEVICE_NONE);
+                         is_gamecube ? SerialInterface::SIDEVICE_GC_CONTROLLER :
+                                       SerialInterface::SIDEVICE_NONE);
+      Config::SetCurrent(Config::GetInfoForWiimoteSource(port),
+                         is_wiimote ? WiimoteSource::Emulated : WiimoteSource::None);
     }
-    if (!Rollback::StartNetplayReplaySession())
+    if (!Rollback::StartNetplayReplaySession(disable_project_plus_music))
     {
       Rollback::StopNetplayReplay();
       FailManagedSession("The Netplay Replay session could not be started");
@@ -2073,6 +2182,8 @@ void MainWindow::StartManagedNetPlay()
     }
     auto boot_session_data = std::make_unique<BootSessionData>();
     boot_session_data->SetNetplayReplay(true);
+    boot_session_data->SetBrawlControllerProfiles(
+        Rollback::GetNetplayReplayBrawlControllerProfiles());
     // Recreate the normal NetPlay save initialization for the selected Wii disc. Leaving this list
     // empty makes replay playback boot from a different temporary NAND than the session that
     // recorded it (for example, Brawl takes a different banner/save-loading path).
@@ -2144,9 +2255,21 @@ void MainWindow::StartManagedNetPlay()
     Config::SetCurrent(Config::MAIN_WII_SD_CARD_IMAGE_PATH, sd_card_path.value_or(""));
     Config::SetCurrent(Config::MAIN_REPLAY_PLAYBACK_FILE, *replay_path);
     Config::SetCurrent(Config::MAIN_REPLAY_PLAYBACK_PROJECT_PLUS, project_plus);
+    Config::SetCurrent(Config::NETPLAY_BRAWL_MUSIC_OFF, disable_project_plus_music);
     File::SetUserPath(F_WIISDCARDIMAGE_IDX, sd_card_path.value_or(""));
+    // Replay-menu navigation is generated internally and must not depend on a physical adapter or
+    // the user's persistent port configuration.
+    for (int port = 0; port < SerialInterface::MAX_SI_CHANNELS; ++port)
+    {
+      Config::SetCurrent(Config::GetInfoForSIDevice(port),
+                         port == 0 ? SerialInterface::SIDEVICE_GC_CONTROLLER :
+                                     SerialInterface::SIDEVICE_NONE);
+      Config::SetCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::None);
+    }
+    auto boot_session_data = std::make_unique<BootSessionData>();
+    boot_session_data->SetBrawlReplay(*replay_path, project_plus);
     ReportManagedStatus("preparing");
-    StartGame(launch_path, ScanForSecondDisc::Yes);
+    StartGame(launch_path, ScanForSecondDisc::No, std::move(boot_session_data));
     return;
   }
   const auto seat_it = ticket.find("seat");
@@ -2179,6 +2302,7 @@ void MainWindow::StartManagedNetPlay()
   m_managed_session->game = *game;
   m_managed_session->rendezvous_address = *rendezvous_address;
   m_managed_session->rendezvous_token = *rendezvous_token;
+  m_managed_session->session_fingerprint = session_fingerprint.value_or("");
   m_managed_session->brawl_iso_path = brawl_iso_path.value_or("");
   m_managed_session->project_plus_sd_path = project_plus_sd_path.value_or("");
   m_managed_session->sd_card_path = custom_sd_card_path.value_or("");
@@ -2196,11 +2320,13 @@ void MainWindow::StartManagedNetPlay()
       static_cast<int>(players_it->second.get<picojson::array>().size());
   m_managed_session->player_ids.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
   m_managed_session->player_names.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
-  m_managed_session->controller_types.resize(
-      static_cast<size_t>(m_managed_session->player_count) + 1,
-      static_cast<u8>(Rollback::ControllerType::GameCube));
-  m_managed_session->controller_tags.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
-  m_managed_session->controller_profiles.resize(static_cast<size_t>(m_managed_session->player_count) + 1);
+  m_managed_session->controller_types.resize(static_cast<size_t>(m_managed_session->player_count) +
+                                                 1,
+                                             static_cast<u8>(Rollback::ControllerType::GameCube));
+  m_managed_session->controller_tags.resize(static_cast<size_t>(m_managed_session->player_count) +
+                                            1);
+  m_managed_session->controller_profiles.resize(
+      static_cast<size_t>(m_managed_session->player_count) + 1);
   const auto test_solo_it = ticket.find("test_solo");
   m_managed_session->test_solo = test_solo_it != ticket.end() && test_solo_it->second.is<bool>() &&
                                  test_solo_it->second.get<bool>();
@@ -2216,11 +2342,7 @@ void MainWindow::StartManagedNetPlay()
   m_managed_session->enable_random_inputs = enable_random_inputs_it != ticket.end() &&
                                             enable_random_inputs_it->second.is<bool>() &&
                                             enable_random_inputs_it->second.get<bool>();
-  const auto disable_project_plus_music_it = ticket.find("disable_project_plus_music");
-  m_managed_session->disable_project_plus_music =
-      disable_project_plus_music_it != ticket.end() &&
-      disable_project_plus_music_it->second.is<bool>() &&
-      disable_project_plus_music_it->second.get<bool>();
+  m_managed_session->disable_project_plus_music = disable_project_plus_music;
   const auto native_stress_it = ticket.find("native_stress");
   m_managed_session->native_stress = native_stress_it != ticket.end() &&
                                      native_stress_it->second.is<bool>() &&
@@ -2265,10 +2387,9 @@ void MainWindow::StartManagedNetPlay()
                                                full_scan_keep_tracking_it->second.is<bool>() &&
                                                full_scan_keep_tracking_it->second.get<bool>();
   const auto parallel_dirty_compare_it = ticket.find("parallel_dirty_compare");
-  m_managed_session->parallel_dirty_compare =
-      parallel_dirty_compare_it == ticket.end() ||
-      !parallel_dirty_compare_it->second.is<bool>() ||
-      parallel_dirty_compare_it->second.get<bool>();
+  m_managed_session->parallel_dirty_compare = parallel_dirty_compare_it == ticket.end() ||
+                                              !parallel_dirty_compare_it->second.is<bool>() ||
+                                              parallel_dirty_compare_it->second.get<bool>();
   const auto tracked_bitmap_clear_it = ticket.find("tracked_bitmap_clear");
   m_managed_session->tracked_bitmap_clear = tracked_bitmap_clear_it == ticket.end() ||
                                             !tracked_bitmap_clear_it->second.is<bool>() ||
@@ -2372,13 +2493,14 @@ void MainWindow::StartManagedNetPlay()
           return;
         }
       }
-      const std::string tag = controller_tag != player.end() && controller_tag->second.is<std::string>() ?
-                                  controller_tag->second.get<std::string>() :
-                                  std::string{};
-      const std::string profile = controller_profile != player.end() &&
-                                          controller_profile->second.is<std::string>() ?
-                                      controller_profile->second.get<std::string>() :
-                                      std::string{};
+      const std::string tag =
+          controller_tag != player.end() && controller_tag->second.is<std::string>() ?
+              controller_tag->second.get<std::string>() :
+              std::string{};
+      const std::string profile =
+          controller_profile != player.end() && controller_profile->second.is<std::string>() ?
+              controller_profile->second.get<std::string>() :
+              std::string{};
       if (!Rollback::ParseBrawlControllerProfile(tag, profile))
       {
         FailManagedSession("The matchmaking ticket contains an invalid controller profile");
@@ -2503,10 +2625,8 @@ void MainWindow::StartManagedNetPlay()
     }
     Config::SetCurrent(Config::MAIN_DEFAULT_ISO, m_managed_session->brawl_iso_path);
     Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME, "Brawl");
-    game_path =
-        File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "vBrawl Netplay Launcher.dol";
-    if (m_managed_session->sd_card_path.empty() ||
-        !File::Exists(m_managed_session->sd_card_path))
+    game_path = File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "vBrawl Netplay Launcher.dol";
+    if (m_managed_session->sd_card_path.empty() || !File::Exists(m_managed_session->sd_card_path))
     {
       FailManagedSession("The bundled vBrawl SD card is missing");
       m_managed_session.reset();
@@ -2609,7 +2729,8 @@ void MainWindow::StartManagedNetPlay()
       NetPlayQuit();
       return;
     }
-    server->SetManagedPlayers(m_managed_session->match_id, m_managed_session->player_ids);
+    server->SetManagedPlayers(m_managed_session->match_id, m_managed_session->player_ids,
+                              m_managed_session->session_fingerprint);
     server->SetManagedGeckoCodesPath(m_managed_session->gecko_codes_path);
     server->ChangeGame(selected_game.GetSyncIdentifier(),
                        m_game_list->GetNetPlayName(selected_game));
@@ -2624,6 +2745,7 @@ void MainWindow::StartManagedNetPlay()
 
   NOTICE_LOG_FMT(NETPLAY, "Managed launch: NetPlay client joined (seat={})",
                  m_managed_session->seat);
+  ReportManagedStatus("synchronizing");
 
   if (m_managed_session->seat == 1)
     QTimer::singleShot(100, this, &MainWindow::PollManagedNetPlayReady);
@@ -2771,6 +2893,7 @@ bool MainWindow::NetPlayJoin()
     managed_config->match_id = m_managed_session->match_id;
     managed_config->player_id = m_managed_session->player_id;
     managed_config->rendezvous_token = m_managed_session->rendezvous_token;
+    managed_config->session_fingerprint = m_managed_session->session_fingerprint;
     managed_config->seat = m_managed_session->seat;
     managed_config->player_count = m_managed_session->player_count;
     managed_config->coordinator = m_managed_session->seat == 1;
@@ -2779,23 +2902,21 @@ bool MainWindow::NetPlayJoin()
     managed_config->controller_types.reserve(m_managed_session->player_count);
     for (int seat = 1; seat <= m_managed_session->player_count; ++seat)
     {
-      managed_config->controller_types.push_back(m_managed_session->game_platform == 0 ?
-                                                     Rollback::ControllerType::GameCube :
-                                                     static_cast<Rollback::ControllerType>(
-                                                         m_managed_session->controller_types[seat]));
+      managed_config->controller_types.push_back(
+          m_managed_session->game_platform == 0 ?
+              Rollback::ControllerType::GameCube :
+              static_cast<Rollback::ControllerType>(m_managed_session->controller_types[seat]));
     }
     auto& rollback_options = managed_config->rollback_options;
     rollback_options.controller_types = managed_config->controller_types;
     rollback_options.brawl_controller_profiles.reserve(m_managed_session->player_count);
     for (int seat = 1; seat <= m_managed_session->player_count; ++seat)
     {
-      rollback_options.brawl_controller_profiles.push_back(
-          *Rollback::ParseBrawlControllerProfile(m_managed_session->controller_tags[seat],
-                                                  m_managed_session->controller_profiles[seat]));
+      rollback_options.brawl_controller_profiles.push_back(*Rollback::ParseBrawlControllerProfile(
+          m_managed_session->controller_tags[seat], m_managed_session->controller_profiles[seat]));
       if (!m_managed_session->controller_tags[seat].empty())
       {
-        NOTICE_LOG_FMT(NETPLAY,
-                       "Managed controller profile: P{} tag='{}' payload_bytes={}", seat,
+        NOTICE_LOG_FMT(NETPLAY, "Managed controller profile: P{} tag='{}' payload_bytes={}", seat,
                        m_managed_session->controller_tags[seat],
                        m_managed_session->controller_profiles[seat].size() / 2);
       }
