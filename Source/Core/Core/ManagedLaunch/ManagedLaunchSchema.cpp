@@ -58,7 +58,8 @@ ValidationResult ValidateOptionalTypes(const picojson::object& ticket)
       "replay_output_path",   "replay_input_path",     "replay_path",
       "gecko_codes_path",     "wii_save_data_bin_path", "video_backend",
       "gamecube_memory_card_path", "wii_nand_path",
-      "session_fingerprint",
+      "session_fingerprint",  "base_disc_path",       "replay_game_name",
+      "controller_tag",       "controller_profile",
   };
   static const std::unordered_set<std::string> bool_fields{
       "stress_test",
@@ -160,7 +161,8 @@ ValidationResult ValidateTicket(const picojson::value& root)
       "full_scan_keep_tracking", "parallel_dirty_compare", "tracked_bitmap_clear",
       "compare_confirmed_ram", "compare_confirmed_video", "stop_ram_compare_on_mismatch",
       "coarse_fifo_timing", "late_vi_guard", "save_replays", "start_fullscreen",
-      "gamecube_memory_card_path", "wii_nand_path", "session_fingerprint"};
+      "gamecube_memory_card_path", "wii_nand_path", "session_fingerprint", "base_disc_path",
+      "replay_game_name", "controller_tag", "controller_profile"};
   for (const auto& [name, unused] : ticket)
   {
     if (!allowed_fields.contains(name))
@@ -254,6 +256,12 @@ ValidationResult ValidateTicket(const picojson::value& root)
     if (!HasString(ticket, "brawl_iso_path", true) ||
         !HasString(ticket, "project_plus_sd_path", true) ||
         !HasString(ticket, "sd_card_path", true) || !HasString(ticket, "game_path", true) ||
+        !HasString(ticket, "base_disc_path", true) ||
+        !HasString(ticket, "gecko_codes_path", true) ||
+        !HasString(ticket, "wii_save_data_bin_path", true) ||
+        !HasString(ticket, "replay_game_name", true) ||
+        !HasString(ticket, "controller_tag", true) ||
+        !HasString(ticket, "controller_profile", true) ||
         !HasString(ticket, "replay_path") || !HasInteger(ticket, "aspect_ratio", 0, 5) ||
         !HasString(ticket, "video_backend") ||
         !HasInteger(ticket, "internal_resolution", 1, 12) ||
@@ -274,6 +282,11 @@ ValidationResult ValidateTicket(const picojson::value& root)
         !ticket.at("wii_nand_path").get<std::string>().empty())
     {
       return Invalid("GameCube memory-card and Wii NAND overrides are mutually exclusive");
+    }
+    if (ticket.at("controller_tag").get<std::string>().empty() !=
+        ticket.at("controller_profile").get<std::string>().empty())
+    {
+      return Invalid("Replay controller tag and profile must be supplied together");
     }
   }
   else

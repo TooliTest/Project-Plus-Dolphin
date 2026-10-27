@@ -19,6 +19,7 @@
 #include <list>
 
 #include <OptionParser.h>
+#include <fmt/format.h>
 #include <picojson.h>
 #include <QAbstractEventDispatcher>
 #include <QApplication>
@@ -44,6 +45,8 @@
 #include "Core/System.h"
 
 #include "DiscIO/Enums.h"
+#include "DiscIO/Volume.h"
+#include "DiscIO/VolumeVerifier.h"
 
 #include "DolphinQt/Host.h"
 #include "DolphinQt/MainWindow.h"
@@ -132,6 +135,45 @@ static bool ExportBrawlbackGameList(const std::string& output_path,
   });
 
   return File::WriteStringToFile(output_path, picojson::value(games).serialize(true));
+}
+
+static std::string HexString(const std::vector<u8>& bytes)
+{
+  std::string hex;
+  hex.reserve(bytes.size() * 2);
+  for (const u8 byte : bytes)
+    hex += fmt::format("{:02x}", byte);
+  return hex;
+}
+
+// Writes the disc's MD5 exactly as the Verify tab computes it: over the whole raw disc that the
+// blob reader reconstructs, so an ISO and a lossless RVZ, WIA, GCZ, or CISO of one dump agree and
+// a good dump matches its Redump entry.
+static bool ExportBrawlbackDiscHash(const std::string& disc_path, const std::string& output_path)
+{
+  picojson::object result;
+  const std::unique_ptr<DiscIO::Volume> volume = DiscIO::CreateVolume(disc_path);
+  if (!volume)
+  {
+    result["error"] = picojson::value("Dolphin could not open this file as a disc image");
+  }
+  else
+  {
+    DiscIO::Hashes<bool> hashes_to_calculate{};
+    hashes_to_calculate.md5 = true;
+    DiscIO::VolumeVerifier verifier(*volume, false, hashes_to_calculate);
+    verifier.Start();
+    while (verifier.GetBytesProcessed() != verifier.GetTotalBytes())
+      verifier.Process();
+    verifier.Finish();
+    const std::vector<u8>& md5 = verifier.GetResult().hashes.md5;
+    if (md5.empty())
+      result["error"] = picojson::value("Dolphin could not read the whole disc image to hash it");
+    else
+      result["md5"] = picojson::value(HexString(md5));
+  }
+  const bool hashed = result.contains("md5");
+  return File::WriteStringToFile(output_path, picojson::value(result).serialize()) && hashed;
 }
 
 static bool QtMsgAlertHandler(const char* caption, const char* text, bool yes_no,
@@ -327,6 +369,15 @@ int main(int argc, char* argv[])
   UICommon::SetUserDirectory(static_cast<const char*>(options.get("user")));
   UICommon::CreateDirectories();
   UICommon::Init();
+
+  if (options.is_set("brawlback_disc_hash"))
+  {
+    const bool hashed =
+        ExportBrawlbackDiscHash(static_cast<const char*>(options.get("brawlback_disc_hash")),
+                                static_cast<const char*>(options.get("brawlback_disc_hash_output")));
+    UICommon::Shutdown();
+    return hashed ? 0 : 1;
+  }
 
   if (options.is_set("brawlback_game_list"))
   {

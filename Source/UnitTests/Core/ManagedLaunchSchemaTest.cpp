@@ -78,6 +78,12 @@ constexpr const char* VALID_REPLAY_TICKET = R"json({
   "project_plus_sd_path": "fixtures/sd.raw",
   "sd_card_path": "",
   "game_path": "",
+  "base_disc_path": "",
+  "gecko_codes_path": "",
+  "wii_save_data_bin_path": "",
+  "replay_game_name": "Project+",
+  "controller_tag": "",
+  "controller_profile": "",
   "replay_path": "fixtures/replay.npr",
   "aspect_ratio": 0,
   "video_backend": "D3D",
@@ -94,6 +100,32 @@ TEST(ManagedLaunchSchema, AcceptsCanonicalNetplayTicket)
 {
   const ValidationResult result = ValidateTicket(Parse(VALID_TICKET));
   EXPECT_TRUE(result) << result.error;
+}
+
+TEST(ManagedLaunchSchema, AcceptsConfigDrivenLauncherFields)
+{
+  picojson::value launcher = Parse(VALID_TICKET);
+  picojson::object& ticket = launcher.get<picojson::object>();
+  ticket["game_path"] = picojson::value{std::string{"Launcher/Project+ Netplay Launcher.dol"}};
+  ticket["base_disc_path"] = picojson::value{std::string{"fixtures/brawl.iso"}};
+  ticket["replay_game_name"] = picojson::value{std::string{"Project+"}};
+  const ValidationResult result = ValidateTicket(launcher);
+  EXPECT_TRUE(result) << result.error;
+
+  picojson::value replay = Parse(VALID_REPLAY_TICKET);
+  replay.get<picojson::object>()["base_disc_path"] =
+      picojson::value{std::string{"fixtures/brawl.iso"}};
+  EXPECT_TRUE(ValidateTicket(replay));
+
+  ticket["base_disc_path"] = picojson::value{true};
+  EXPECT_FALSE(ValidateTicket(launcher));
+}
+
+TEST(ManagedLaunchSchema, ReplayControllerTagAndProfileMustBePaired)
+{
+  picojson::value replay = Parse(VALID_REPLAY_TICKET);
+  replay.get<picojson::object>()["controller_tag"] = picojson::value{std::string{"P1"}};
+  EXPECT_FALSE(ValidateTicket(replay));
 }
 
 TEST(ManagedLaunchSchema, ReplayRequiresExplicitMusicSetting)

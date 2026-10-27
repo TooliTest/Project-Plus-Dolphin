@@ -3,8 +3,6 @@
 
 #include "DolphinQt/Host.h"
 
-#include <functional>
-
 #include <QAbstractEventDispatcher>
 #include <QApplication>
 #include <QLocale>
@@ -24,7 +22,6 @@
 #include "Core/Host.h"
 #include "Core/NetPlayClient.h"
 #include "Core/NetPlayProto.h"
-#include "Core/Rollback/GekkoRollback.h"
 #include "Core/State.h"
 #include "Core/System.h"
 
@@ -79,46 +76,6 @@ void Host::SetMainWindowHandle(void* handle)
   m_main_window_handle = handle;
 }
 
-static void RunWithGPUThreadInactive(const std::function<void()>& f)
-{
-  // Potentially any thread which shows panic alerts can be blocked on this returning.
-  // This means that, in order to avoid deadlocks, we need to be careful with how we
-  // synchronize with other threads. Note that the panic alert handler temporarily declares
-  // us as the CPU and/or GPU thread if the panic alert was requested by that thread.
-
-  // TODO: What about the unlikely case where the GPU thread calls the panic alert handler
-  // while the panic alert handler is processing a panic alert from the CPU thread?
-
-  if (Core::IsGPUThread())
-  {
-    // If we are the GPU thread, we can't call Core::PauseAndLock without getting a deadlock,
-    // since it would try to pause the GPU thread while that thread is waiting for us.
-    // However, since we know that the GPU thread is inactive, we can just run f directly.
-
-    f();
-  }
-  else if (Core::IsCPUThread())
-  {
-    // If we are the CPU thread in dual core mode, we can't call Core::PauseAndLock, for the
-    // same reason as above. Instead, we use Fifo::PauseAndLock to pause the GPU thread only.
-    // (Note that this case cannot be reached in single core mode, because in single core mode,
-    // the CPU and GPU threads are the same thread, and we already checked for the GPU thread.)
-
-    auto& system = Core::System::GetInstance();
-    const bool was_running = Core::GetState(system) == Core::State::Running;
-    auto& fifo = system.GetFifo();
-    fifo.PauseAndLock();
-    f();
-    fifo.RestoreState(was_running);
-  }
-  else
-  {
-    // If we reach here, we can call Core::PauseAndLock (which we do using a CPUThreadGuard).
-    const Core::CPUThreadGuard guard(Core::System::GetInstance());
-    f();
-  }
-}
-
 bool Host::GetRenderFocus()
 {
 #ifdef _WIN32
@@ -140,13 +97,9 @@ bool Host::GetRenderFullFocus()
 void Host::SetRenderFocus(bool focus)
 {
   m_render_focus = focus;
-  if (g_gfx && m_render_fullscreen && g_ActiveConfig.ExclusiveFullscreenEnabled())
-  {
-    RunWithGPUThreadInactive([focus] {
-      if (!Config::Get(Config::MAIN_RENDER_TO_MAIN))
-        g_gfx->SetFullscreen(focus);
-    });
-  }
+  if (g_gfx && m_render_fullscreen && g_ActiveConfig.ExclusiveFullscreenEnabled() &&
+      !Config::Get(Config::MAIN_RENDER_TO_MAIN))
+    g_gfx->SetFullscreen(focus);
 }
 
 void Host::SetRenderFullFocus(bool focus)
@@ -176,20 +129,8 @@ bool Host::GetRenderFullscreen()
 void Host::SetRenderFullscreen(bool fullscreen)
 {
   m_render_fullscreen = fullscreen;
-
-  if (g_gfx && g_gfx->IsFullscreen() != fullscreen && g_ActiveConfig.ExclusiveFullscreenEnabled())
-  {
-    const auto change = [fullscreen] {
-      RunWithGPUThreadInactive([fullscreen] { g_gfx->SetFullscreen(fullscreen); });
-    };
-    if (Rollback::IsGekkoSessionActive())
-    {
-      if (!Rollback::QueueLocalPresentationChange(change))
-        ERROR_LOG_FMT(VIDEO, "Could not queue exclusive-fullscreen transition at frame boundary");
-      return;
-    }
-    change();
-  }
+  if (g_gfx && g_ActiveConfig.ExclusiveFullscreenEnabled())
+    g_gfx->SetFullscreen(fullscreen);
 }
 
 void Host::SetTASInputFocus(const bool focus)

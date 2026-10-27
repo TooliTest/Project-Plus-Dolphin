@@ -44,6 +44,7 @@ static bool IsVSyncActive(bool enabled)
 {
   // Vsync is disabled when the throttler is disabled by the tab key.
   return enabled && !Core::GetIsThrottlerTempDisabled() &&
+         !Core::IsReplayBootFastForwardActive() &&
          Config::Get(Config::MAIN_EMULATION_SPEED) == 1.0;
 }
 

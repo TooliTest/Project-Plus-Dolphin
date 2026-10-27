@@ -29,6 +29,13 @@ namespace NetPlay
 class NetPlayUI;
 struct SaveSyncInfo;
 
+struct ManagedNetPlayHostConfig
+{
+  std::string match_id;
+  std::vector<std::string> player_ids;
+  std::string session_fingerprint;
+};
+
 class NetPlayServer : public Common::TraversalClientClient
 {
 public:
@@ -41,7 +48,8 @@ public:
                             const std::string& title = "");
 
   NetPlayServer(u16 port, bool forward_port, NetPlayUI* dialog,
-                const NetTraversalConfig& traversal_config);
+                const NetTraversalConfig& traversal_config,
+                std::optional<ManagedNetPlayHostConfig> managed_config = std::nullopt);
   ~NetPlayServer() override;
 
   bool ChangeGame(const SyncIdentifier& sync_identifier, const std::string& netplay_name);
@@ -58,8 +66,6 @@ public:
   PadMappingArray GetPadMapping() const;
   void SetPadMapping(const PadMappingArray& mappings);
   void SetManagedRollbackEndpoints(std::vector<std::string> endpoints);
-  void SetManagedPlayers(std::string match_id, std::vector<std::string> player_ids,
-                         std::string session_fingerprint);
   void SetManagedGeckoCodesPath(std::string path);
 
   GBAConfigArray GetGBAConfig() const;

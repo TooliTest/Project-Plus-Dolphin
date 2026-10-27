@@ -601,7 +601,7 @@ bool SwapChain::RecreateSurface(void* native_handle)
   m_fullscreen_supported = g_vulkan_context->SupportsExclusiveFullscreen(m_wsi, m_surface);
   g_backend_info.bSupportsExclusiveFullscreen = m_fullscreen_supported;
   m_current_fullscreen_state = false;
-  m_next_fullscreen_state = false;
+  m_fullscreen_requested.store(false, std::memory_order_release);
 
   // Finally re-create the swap chain
   if (!CreateSwapChain() || !SetupSwapChainImages())

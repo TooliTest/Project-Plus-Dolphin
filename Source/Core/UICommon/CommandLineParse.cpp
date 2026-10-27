@@ -109,6 +109,16 @@ std::unique_ptr<optparse::OptionParser> CreateParser(ParserOptions options)
       .metavar("<file>")
       .type("string")
       .help("Include a specific game in a Brawlback game-list refresh");
+  parser->add_option("--brawlback-disc-hash")
+      .action("store")
+      .metavar("<file>")
+      .type("string")
+      .help("Compute a disc image's Redump MD5 as Verify does, write it as JSON, and exit");
+  parser->add_option("--brawlback-disc-hash-output")
+      .action("store")
+      .metavar("<file>")
+      .type("string")
+      .help("Where --brawlback-disc-hash writes its JSON result");
   parser->add_option("-e", "--exec")
       .action("append")
       .metavar("<file>")

@@ -262,31 +262,40 @@ void SwapChain::SetHDR(bool hdr)
 
 bool SwapChain::GetFullscreen() const
 {
-  return GetFullscreenState(m_swap_chain.Get());
+  return m_fullscreen_active.load(std::memory_order_acquire);
 }
 
 void SwapChain::SetFullscreen(bool request)
 {
-  m_swap_chain->SetFullscreenState(request, nullptr);
+  m_fullscreen_requested.store(request, std::memory_order_release);
 }
 
 bool SwapChain::CheckForFullscreenChange()
 {
-  if (m_fullscreen_request != m_has_fullscreen)
+  bool requested = m_fullscreen_requested.load(std::memory_order_acquire);
+  const bool active = m_fullscreen_active.load(std::memory_order_acquire);
+  if (requested != active)
   {
-    HRESULT hr = m_swap_chain->SetFullscreenState(m_fullscreen_request, nullptr);
+    const HRESULT hr = m_swap_chain->SetFullscreenState(requested, nullptr);
     if (SUCCEEDED(hr))
     {
-      m_has_fullscreen = m_fullscreen_request;
+      m_fullscreen_active.store(requested, std::memory_order_release);
       return true;
     }
+
+    WARN_LOG_FMT(VIDEO, "Exclusive fullscreen transition failed: {}", Common::HRWrap(hr));
+    m_fullscreen_requested.compare_exchange_strong(requested, active,
+                                                   std::memory_order_acq_rel);
   }
 
-  const bool new_fullscreen_state = GetFullscreenState(m_swap_chain.Get());
-  if (new_fullscreen_state != m_has_fullscreen)
+  const bool observed = GetFullscreenState(m_swap_chain.Get());
+  const bool known_active = m_fullscreen_active.load(std::memory_order_acquire);
+  if (observed != known_active)
   {
-    m_has_fullscreen = new_fullscreen_state;
-    m_fullscreen_request = new_fullscreen_state;
+    m_fullscreen_active.store(observed, std::memory_order_release);
+    bool expected_request = known_active;
+    m_fullscreen_requested.compare_exchange_strong(expected_request, observed,
+                                                   std::memory_order_acq_rel);
     return true;
   }
 
@@ -299,7 +308,8 @@ bool SwapChain::Present()
   // supported, even when presenting in windowed mode. However, this flag cannot be used if the app
   // is in fullscreen mode as a result of calling SetFullscreenState.
   UINT present_flags = 0;
-  if (m_allow_tearing_supported && !g_ActiveConfig.bVSyncActive && !m_has_fullscreen)
+  if (m_allow_tearing_supported && !g_ActiveConfig.bVSyncActive &&
+      !m_fullscreen_active.load(std::memory_order_acquire))
     present_flags |= DXGI_PRESENT_ALLOW_TEARING;
 
   HRESULT hr = m_swap_chain->Present(static_cast<UINT>(g_ActiveConfig.bVSyncActive), present_flags);

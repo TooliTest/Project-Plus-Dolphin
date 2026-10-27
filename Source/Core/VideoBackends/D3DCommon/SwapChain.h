@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <dxgi1_5.h>
 #include <wrl/client.h>
 
@@ -71,8 +73,8 @@ protected:
   bool m_stereo = false;
   bool m_hdr = false;
   bool m_allow_tearing_supported = false;
-  bool m_has_fullscreen = false;
-  bool m_fullscreen_request = false;
+  std::atomic<bool> m_fullscreen_active{false};
+  std::atomic<bool> m_fullscreen_requested{false};
 };
 
 }  // namespace D3DCommon

@@ -102,6 +102,7 @@ static std::thread s_emu_thread;
 static Common::HookableEvent<Core::State> s_state_changed_event;
 
 static bool s_is_throttler_temp_disabled = false;
+static std::atomic_bool s_replay_boot_fast_forward_active{false};
 static bool s_frame_step = false;
 static std::atomic<bool> s_stop_frame_step;
 
@@ -142,6 +143,16 @@ bool GetIsThrottlerTempDisabled()
 void SetIsThrottlerTempDisabled(bool disable)
 {
   s_is_throttler_temp_disabled = disable;
+}
+
+bool IsReplayBootFastForwardActive()
+{
+  return s_replay_boot_fast_forward_active.load(std::memory_order_acquire);
+}
+
+void SetReplayBootFastForwardActive(bool active)
+{
+  s_replay_boot_fast_forward_active.store(active, std::memory_order_release);
 }
 
 void FrameUpdateOnCPUThread()

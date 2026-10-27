@@ -27,6 +27,8 @@ class System;
 
 bool GetIsThrottlerTempDisabled();
 void SetIsThrottlerTempDisabled(bool disable);
+bool IsReplayBootFastForwardActive();
+void SetReplayBootFastForwardActive(bool active);
 
 void Callback_NewField(Core::System& system);
 

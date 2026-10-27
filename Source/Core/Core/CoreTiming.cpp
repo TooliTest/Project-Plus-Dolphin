@@ -510,7 +510,7 @@ bool CoreTimingManager::IsSpeedUnlimited() const
 {
   // Orca: frames re-run after a rollback load catch up to the present as fast as possible.
   return m_throttle_adj_clock_per_sec == 0 || Core::GetIsThrottlerTempDisabled() ||
-         Rollback::IsResimulating();
+         Core::IsReplayBootFastForwardActive() || Rollback::IsResimulating();
 }
 
 std::pair<s64, TimePoint> CoreTimingManager::GetThrottleReference() const

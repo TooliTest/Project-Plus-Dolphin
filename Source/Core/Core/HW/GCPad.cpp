@@ -4,13 +4,15 @@
 #include "Core/HW/GCPad.h"
 
 #include <atomic>
+#include <limits>
 
 #include "Common/Common.h"
-#include "Core/HW/GCPadEmu.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/HW/GCPadEmu.h"
+#include "Core/Movie.h"
 #include "Core/System.h"
-#include "Core/HW/SystemTimers.h"
 #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
 #include "InputCommon/GCPadStatus.h"
 #include "InputCommon/InputConfig.h"
@@ -19,6 +21,9 @@ namespace Pad
 {
 static InputConfig s_config("GCPadNew", _trans("Pad"), "GCPad", "Pad");
 static std::atomic_bool s_replay_boot_input_enabled{false};
+static constexpr u64 REPLAY_MENU_A_TARGET_FRAME = 60 * 12;
+static constexpr u64 REPLAY_MENU_A_FRAME_UNSET = std::numeric_limits<u64>::max();
+static std::atomic<u64> s_replay_menu_a_frame{REPLAY_MENU_A_FRAME_UNSET};
 InputConfig* GetConfig()
 {
   return &s_config;
@@ -69,7 +74,9 @@ GCPadStatus GetStatus(int pad_num)
 
 void SetReplayBootInputEnabled(bool enabled)
 {
+  s_replay_menu_a_frame.store(REPLAY_MENU_A_FRAME_UNSET, std::memory_order_release);
   s_replay_boot_input_enabled.store(enabled, std::memory_order_release);
+  Core::SetReplayBootFastForwardActive(enabled);
 }
 
 void ApplyReplayBootInput(int pad_num, GCPadStatus* status)
@@ -78,13 +85,24 @@ void ApplyReplayBootInput(int pad_num, GCPadStatus* status)
     return;
 
   auto& system = Core::System::GetInstance();
-  const u64 ticks_per_second = system.GetSystemTimers().GetTicksPerSecond();
-  const u64 press_a_at = ticks_per_second * 13 / 2;
+  const u64 frame = system.GetMovie().GetCurrentFrame();
+  u64 a_frame = s_replay_menu_a_frame.load(std::memory_order_acquire);
+  if (frame >= REPLAY_MENU_A_TARGET_FRAME && a_frame == REPLAY_MENU_A_FRAME_UNSET)
+  {
+    s_replay_menu_a_frame.compare_exchange_strong(a_frame, frame, std::memory_order_acq_rel);
+    a_frame = s_replay_menu_a_frame.load(std::memory_order_acquire);
+  }
+  const bool pressing_a = frame == a_frame;
 
-  // Replay startup must not depend on a physical adapter being available. Present a neutral,
-  // connected controller while holding Z, then release Z and hold A for one second.
-  *status = {};
-  status->button = system.GetCoreTiming().GetTicks() < press_a_at ? PAD_TRIGGER_Z : PAD_BUTTON_A;
+  if (pressing_a && Core::IsReplayBootFastForwardActive())
+  {
+    Core::SetReplayBootFastForwardActive(false);
+    system.GetCoreTiming().ResetThrottleToNow();
+  }
+
+  // Keep the user's live P1 input available while adding the replay-menu startup sequence.
+  status->isConnected = true;
+  status->button |= pressing_a ? PAD_BUTTON_A : PAD_TRIGGER_Z;
 }
 
 bool IsReplayBootInputActive(int pad_num)
@@ -93,9 +111,10 @@ bool IsReplayBootInputActive(int pad_num)
     return false;
 
   auto& system = Core::System::GetInstance();
-  const u64 sequence_ticks =
-      static_cast<u64>(system.GetSystemTimers().GetTicksPerSecond()) * 15 / 2;
-  return system.GetCoreTiming().GetTicks() < sequence_ticks;
+  const u64 frame = system.GetMovie().GetCurrentFrame();
+  const u64 a_frame = s_replay_menu_a_frame.load(std::memory_order_acquire);
+  return frame < REPLAY_MENU_A_TARGET_FRAME || a_frame == REPLAY_MENU_A_FRAME_UNSET ||
+         frame <= a_frame;
 }
 
 ControllerEmu::ControlGroup* GetGroup(int pad_num, PadGroup group)

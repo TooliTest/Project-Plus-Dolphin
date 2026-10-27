@@ -122,7 +122,8 @@ NetPlayServer::~NetPlayServer()
 
 // called from ---GUI--- thread
 NetPlayServer::NetPlayServer(const u16 port, const bool forward_port, NetPlayUI* dialog,
-                             const NetTraversalConfig& traversal_config)
+                             const NetTraversalConfig& traversal_config,
+                             std::optional<ManagedNetPlayHostConfig> managed_config)
     : m_dialog(dialog)
 {
   //--use server time
@@ -134,6 +135,15 @@ NetPlayServer::NetPlayServer(const u16 port, const bool forward_port, NetPlayUI*
   m_pad_map.fill(0);
   m_gba_config.fill({});
   m_wiimote_map.fill(0);
+
+  // Configure the managed identity before the network thread starts. Otherwise a peer can reach
+  // OnConnect between server construction and a later setter call and be rejected as unmanaged.
+  if (managed_config)
+  {
+    m_managed_match_id = std::move(managed_config->match_id);
+    m_managed_player_ids = std::move(managed_config->player_ids);
+    m_managed_session_fingerprint = std::move(managed_config->session_fingerprint);
+  }
 
   if (traversal_config.use_traversal)
   {
@@ -477,11 +487,17 @@ ConnectionError NetPlayServer::OnConnect(ENetPeer* incoming_connection, sf::Pack
     if (!managed)
       return ConnectionError::ManagedSessionMismatch;
     received_packet >> match_id >> player_id >> requested_seat >> session_fingerprint;
-    if (match_id != m_managed_match_id || requested_seat == 0 ||
-        requested_seat >= m_managed_player_ids.size() ||
-        m_managed_player_ids[requested_seat] != player_id ||
-        session_fingerprint != m_managed_session_fingerprint)
+    const bool valid_seat = requested_seat > 0 && requested_seat < m_managed_player_ids.size();
+    const bool match_matches = match_id == m_managed_match_id;
+    const bool player_matches = valid_seat && m_managed_player_ids[requested_seat] == player_id;
+    const bool fingerprint_matches = session_fingerprint == m_managed_session_fingerprint;
+    if (!match_matches || !valid_seat || !player_matches || !fingerprint_matches)
     {
+      ERROR_LOG_FMT(NETPLAY,
+                    "Managed peer rejected: match_matches={} valid_seat={} player_matches={} "
+                    "fingerprint_matches={} requested_seat={} roster_size={}",
+                    match_matches, valid_seat, player_matches, fingerprint_matches, requested_seat,
+                    m_managed_player_ids.empty() ? 0 : m_managed_player_ids.size() - 1);
       return ConnectionError::ManagedSessionMismatch;
     }
     if (m_players.contains(requested_seat))
@@ -2644,15 +2660,6 @@ void NetPlayServer::AssignNewUserAPad(const Client& player)
   }
   // Do not auto-assign a Wii Remote slot. Rollback carries GC pads only, and an implicit Wiimote
   // mapping forced emulated Wii Remotes on even when the user's input config had none.
-}
-
-void NetPlayServer::SetManagedPlayers(std::string match_id, std::vector<std::string> player_ids,
-                                      std::string session_fingerprint)
-{
-  std::lock_guard lkp(m_crit.players);
-  m_managed_match_id = std::move(match_id);
-  m_managed_player_ids = std::move(player_ids);
-  m_managed_session_fingerprint = std::move(session_fingerprint);
 }
 
 void NetPlayServer::SetManagedGeckoCodesPath(std::string path)

@@ -43,6 +43,19 @@ using PadIndex = s8;
 using PadMappingArray = std::array<PlayerId, 4>;
 using GBAConfigArray = std::array<GBAConfig, 4>;
 
+// Dolphin presents locally owned controller sources first. Managed rollback has exactly one local
+// controller, so its negotiated in-game seat must read physical source 0 regardless of the
+// temporary NetPlay player ID assigned while connecting.
+constexpr unsigned int GetLocalInputSourceForSlot(unsigned int slot, unsigned int local_slot,
+                                                   unsigned int slot_count)
+{
+  if (slot >= slot_count || local_slot >= slot_count)
+    return slot;
+  if (slot == local_slot)
+    return 0;
+  return slot < local_slot ? slot + 1 : slot;
+}
+
 struct NetSettings
 {
   bool cpu_thread = false;

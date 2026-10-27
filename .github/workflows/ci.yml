@@ -1,4 +1,4 @@
-name: Project+ Dolphin Builder
+name: Brawlback Dolphin Builder
 
 on:
   push:
@@ -7,9 +7,206 @@ on:
   pull_request:
     branches:
       - master
-  workflow_dispatch:
 
 jobs: 
+  build_windows_x86_64:
+    name: Windows Build
+    runs-on: windows-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        repository: Brawlback-Team/Brawlback-Dolphin
+        fetch-depth: 0
+        fetch-tags: true
+    - name: Setup Submodules
+      run: git config --global --add safe.directory . && git submodule update --init --recursive
+    - name: Set Version
+      shell: pwsh
+      run: |
+        if ($env:GITHUB_REF_TYPE -eq 'tag') {
+          $version = $env:GITHUB_REF_NAME
+        } else {
+          $describe = git describe --always --long --dirty
+          $version = [regex]::Replace($describe, '(-0)?-[^-]+((-dirty)?)$', '$2')
+        }
+        "DOLPHINVER=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    - name: Configure CMake
+      run: cmake -S . -B build -A x64 "-DCMAKE_TOOLCHAIN_FILE=CMake/DolphinToolchain.cmake" -DARCH=x86_64
+    - name: Build
+      run: cmake --build build --config Release --parallel
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Brawlback-Dolphin-Windows-${{ env.DOLPHINVER }}
+        path: Binary/x64/
+        
+  build_macos:
+    name: macOS Build
+    runs-on: macos-15-intel
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: true
+      CCACHE_COMPRESSLEVEL: 9
+      CCACHE_MAXSIZE: 200M
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Brawlback-Team/Brawlback-Dolphin
+          ref: master
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Install Packages
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_ANALYTICS: 1
+        run: |
+          brew install gnu-sed
+          if ! brew install ccache ninja libspng; then
+            brew update
+            brew install ccache ninja libspng
+          fi
+
+      - name: Cache Dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: ~/deps
+          key: macOS deps ${{ hashFiles('.github/workflows/scripts/macos/build-dependencies.sh') }}
+
+      - name: Build Dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: .github/workflows/scripts/macos/build-dependencies.sh
+
+      - name: Cache MoltenVK
+        id: cache-moltenvk
+        uses: actions/cache@v4
+        with:
+          path: ~/moltenvk
+          key: macOS MoltenVK ${{ hashFiles('Externals/MoltenVK') }}
+
+      - name: Build MoltenVK
+        if: steps.cache-moltenvk.outputs.cache-hit != 'true'
+        run: |
+          MVK_VER="$(sed -nr 's/^.*set\(MOLTENVK_VERSION "([^"]+)".*$/\1/p' Externals/MoltenVK/CMakeLists.txt)"
+          if [ -z "$MVK_VER" ]; then
+            echo "::error::Failed to parse MoltenVK version from CMakeLists"
+            exit 1
+          fi
+          git clone --depth 1 --branch "$MVK_VER" https://github.com/KhronosGroup/MoltenVK.git mvk-build
+          pushd mvk-build
+          git apply ../Externals/MoltenVK/patches/*.patch
+          ./fetchDependencies --macos
+          make macos
+          ls -l Package/Release/MoltenVK/dynamic/*
+          chmod 755 Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+          mkdir -p "$HOME/moltenvk/lib/"
+          mv Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib "$HOME/moltenvk/lib/"
+          popd
+          rm -rf mvk-build
+
+      # -- SETUP CCACHE - https://cristianadam.eu/20200113/speeding-up-c-plus-plus-github-actions-using-ccache/
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> $GITHUB_OUTPUT
+
+      - name: Cache ccache cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: macOS ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: macOS ccache
+
+      - name: Generate CMake Files
+        run: |
+          COMMON_ARGS=(
+            -DCMAKE_PREFIX_PATH="$HOME/deps;$HOME/moltenvk"
+            -DCMAKE_BUILD_TYPE=Release
+            -DUSE_BUNDLED_MOLTENVK=OFF
+            -DMACOS_CODE_SIGNING=OFF
+            -DPOSTPROCESS_BUNDLE=ON
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            -DUSE_SYSTEM_LIBS=OFF
+            -DUSE_SYSTEM_BZIP2=ON
+            -DUSE_SYSTEM_CURL=ON
+            -DUSE_SYSTEM_ICONV=ON
+            -DUSE_SYSTEM_SDL3=OFF # we want to use SDL from Externals, anyways
+            -GNinja
+          )
+
+          cmake -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+                -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+                -DCMAKE_SYSTEM_NAME=Darwin \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.00 \
+                "${COMMON_ARGS[@]}" \
+                -B build .
+          cmake -DCMAKE_OSX_ARCHITECTURES=arm64 \
+                -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+                -DCMAKE_SYSTEM_NAME=Darwin \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+                "${COMMON_ARGS[@]}" \
+                -B build-arm .
+
+      - name: Purge .git for space reasons
+        run: rm -rf /home/runner/work/Brawlback-Dolphin-src/.git
+      - name: Build Dolphin (x86_64)
+        working-directory: build
+        run: |
+          ccache -p
+          ccache -s
+          ccache -z
+          ninja brawlback-dolphin
+          ccache -s
+
+      #- name: Build Dolphin (arm64)
+      #  working-directory: build-arm
+      #  run: |
+      #    ccache -p
+      #    ccache -s
+      #    ccache -z
+      #    ninja brawlback-dolphin
+      #    ccache -s 
+
+      - name: Prepare Build Artifacts
+        id: create-artifact
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          lipo -create build/Binaries/DolphinQt.app/Contents/MacOS/DolphinQt -o dolphin # build-arm/Binaries/DolphinQt.app/Contents/MacOS/DolphinQt
+          mv dolphin build/Binaries/DolphinQt.app/Contents/MacOS/DolphinQt
+          TAG="$(git tag --points-at HEAD)"
+          if [ ! -z "$TAG" ]; then
+            SUFFIX="$TAG"
+          elif [ "$EVENT_NAME" == "pull_request" ]; then
+            PR_TITLE=$(echo "${PR_TITLE}" | tr -cd '[a-zA-Z0-9[:space:]]_-')
+            SUFFIX="pr[$PR_NUM]-sha[$PR_SHA]-title[$PR_TITLE"
+            SUFFIX=$(printf "%.99s]" "$SUFFIX")
+          else
+            SUFFIX="sha[$(git rev-parse --short HEAD)]"
+          fi
+          APPNAME="Brawlback-Dolphin-macOS-$SUFFIX"
+          mv build/Binaries/DolphinQt.app "$APPNAME.app"
+          tar --options xz:compression-level=9 -cvJf "$APPNAME.tar.xz" "$APPNAME.app"
+          echo "name=$APPNAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.create-artifact.outputs.name }}
+          path: "*.tar.xz"
+
   build_appimage:
     name: AppImage Build
     runs-on: ubuntu-24.04
@@ -19,7 +216,7 @@ jobs:
     - name: Checkout Upstream Repo
       uses: actions/checkout@v4
       with:
-        repository: NyxTheShield/Project-Plus-Dolphin
+        repository: Brawlback-Team/Brawlback-Dolphin
         ref: master
         fetch-depth: 0
         fetch-tags: true
@@ -27,13 +224,6 @@ jobs:
     - name: Checkout Submodules
       if: steps.cache-submodules.outputs.cache-hit != 'true'
       run: git submodule update --init --recursive -j $(getconf _NPROCESSORS_ONLN)
-
-    - name: Replace Files
-      run: |
-        curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/Source/Core/DolphinQt/MainWindow.cpp -o ${{github.workspace}}/Source/Core/DolphinQt/MainWindow.cpp
-        curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/Externals/GekkoNet/CMakeLists.txt -o ${{github.workspace}}/Externals/GekkoNet/CMakeLists.txt
-        curl -Ls https://raw.githubusercontent.com/TooliTest/Project-Plus-Dolphin/refs/heads/master/CMake/ScmRevGen.cmake -o ${{github.workspace}}/CMake/ScmRevGen.cmake
-      shell: bash
 
     - name: Set Version
       run: |
@@ -81,7 +271,7 @@ jobs:
         libfmt-dev libwayland-dev libxrandr-dev libglu1-mesa-dev libcurl4-openssl-dev x11-utils zenity wget curl git gettext ccache make cmake ninja-build \
         libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-icccm4 libxcb-image0-dev libxcb-cursor-dev libspng-dev
     - name: Purge .git for space reasons
-      run: rm -rf /home/runner/work/Project-Plus-Dolphin-src/.git
+      run: rm -rf /home/runner/work/Brawlback-Dolphin-src/.git
     - name: Update Patchelf
       run: |
         PATCHELFVER=0.14.5
@@ -95,7 +285,7 @@ jobs:
         mkdir -p "$HOME/.ccache"
         mkdir build
         cd build
-        cmake .. -GNinja -DCMAKE_C_COMPILER=/usr/lib/ccache/gcc-13 -DCMAKE_CXX_COMPILER=/usr/lib/ccache/g++-13 -DCMAKE_PREFIX_PATH="${{github.workspace}}/qt/${{ env.yaqti }}/gcc_64/" -Ddatadir:PATH="share/project-plus-dolphin" -DBIN_INSTALL_DIR="install/usr/bin" -DCMAKE_INSTALL_PREFIX="install/usr" -DINC_INSTALL_DIR="install/usr/include" -DLIB_INSTALL_DIR="install/usr/lib" -DPKGCONFIG_INSTALL_DIR="install/usr/lib/pkgconfig" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_NOGUI=OFF
+        cmake .. -GNinja -DCMAKE_C_COMPILER=/usr/lib/ccache/gcc-13 -DCMAKE_CXX_COMPILER=/usr/lib/ccache/g++-13 -DCMAKE_PREFIX_PATH="${{github.workspace}}/qt/${{ env.yaqti }}/gcc_64/" -Ddatadir:PATH="share/brawlback-dolphin" -DBIN_INSTALL_DIR="install/usr/bin" -DCMAKE_INSTALL_PREFIX="install/usr" -DINC_INSTALL_DIR="install/usr/include" -DLIB_INSTALL_DIR="install/usr/lib" -DPKGCONFIG_INSTALL_DIR="install/usr/lib/pkgconfig" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DENABLE_NOGUI=OFF
         ninja
     - name: Install Dolphin
       run: |
@@ -104,7 +294,7 @@ jobs:
     - name: Package Dolphin-Binary
       run: |
         mkdir -p $GITHUB_WORKSPACE/{artifacts,uploads}
-        cp -P build/install/usr/bin/project-plus-dolphin $GITHUB_WORKSPACE/artifacts
+        cp -P build/install/usr/bin/brawlback-dolphin $GITHUB_WORKSPACE/artifacts
     - name: Package Dolphin-AppImage
       env:
         QT_BASE_DIR: /qt/${{ env.yaqti }}/gcc_64
@@ -139,7 +329,7 @@ jobs:
         chmod a+x ./squashfs-root/runtime
         chmod a+x ./squashfs-root/AppRun-patched
         chmod a+x ./squashfs-root/update.sh
-        export UPD_INFO="gh-releases-zsync|Project-Plus-Development-Team|Project-Plus-Dolphin|continuous|Project+_Dolphin-x86_64.AppImage.zsync"
+        export UPD_INFO="gh-releases-zsync|Brawlback-Team|Brawlback-Dolphin|continuous|Brawlback_Dolphin-x86_64.AppImage.zsync"
         /tmp/squashfs-root/AppRun --appdir="$GITHUB_WORKSPACE"/squashfs-root/ --plugin qt -d "$GITHUB_WORKSPACE"/squashfs-root/project-plus-dolphin.desktop -i "$GITHUB_WORKSPACE"/squashfs-root/project-plus-dolphin.svg \
         --exclude-library=libglib* --output appimage
         ls . | grep *.AppImage
@@ -149,13 +339,13 @@ jobs:
         cat "$GITHUB_WORKSPACE"/squashfs-root/AppRun
         /tmp/squashfs-root/usr/bin/linuxdeploy-plugin-appimage --appdir="$GITHUB_WORKSPACE"/squashfs-root/
         ls . | grep *.AppImage
-        mv Project+_Dolphin-x86_64.AppImage $GITHUB_WORKSPACE/uploads/Dolphin_${DOLPHINVER}.AppImage
+        mv Brawlback_Dolphin-x86_64.AppImage $GITHUB_WORKSPACE/uploads/Dolphin_${DOLPHINVER}.AppImage
         ls -al $GITHUB_WORKSPACE/uploads
       continue-on-error: true
     - name: Upload Static Build
       uses: actions/upload-artifact@v4
       with:
-        name: Project-Plus-Dolphin-AppImage-${{ env.DOLPHINVER }}
+        name: Brawlback-Dolphin-AppImage-${{ env.DOLPHINVER }}
         path: uploads/
       env:
         DEFAULT_BRANCH: git-actions

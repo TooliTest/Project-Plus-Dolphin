@@ -230,6 +230,7 @@ public:
   const PadMappingArray& GetPadMapping() const;
   const GBAConfigArray& GetGBAConfig() const;
   const PadMappingArray& GetWiimoteMapping() const;
+  std::optional<unsigned int> GetManagedLocalWiimoteSlot() const;
 
   void AdjustMinimumPadBufferSize(unsigned int size);
 

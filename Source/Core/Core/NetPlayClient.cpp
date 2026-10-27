@@ -3150,6 +3150,24 @@ const PadMappingArray& NetPlayClient::GetWiimoteMapping() const
   return m_net_settings.wiimote_map;
 }
 
+std::optional<unsigned int> NetPlayClient::GetManagedLocalWiimoteSlot() const
+{
+  if (!m_managed_config || m_managed_config->seat < 1 ||
+      m_managed_config->seat > m_managed_config->player_count)
+  {
+    return std::nullopt;
+  }
+
+  const unsigned int local_slot = static_cast<unsigned int>(m_managed_config->seat - 1);
+  if (local_slot >= m_managed_config->controller_types.size() ||
+      m_managed_config->controller_types[local_slot] != Rollback::ControllerType::Wiimote)
+  {
+    return std::nullopt;
+  }
+
+  return local_slot;
+}
+
 void NetPlayClient::SetWiiSyncData(std::unique_ptr<IOS::HLE::FS::FileSystem> fs,
                                    std::vector<u64> titles, std::string redirect_folder)
 {
@@ -3324,6 +3342,15 @@ unsigned int NetPlay::NetPlay_GetLocalWiimoteForSlot(unsigned int slot)
 
   if (!netplay_client)
     return slot;
+
+  if (const auto local_slot = netplay_client->GetManagedLocalWiimoteSlot())
+  {
+    const unsigned int source =
+        GetLocalInputSourceForSlot(slot, *local_slot, std::tuple_size_v<PadMappingArray>);
+    INFO_LOG_FMT(NETPLAY, "Managed Wiimote slot {} uses local source {} (local seat {})", slot,
+                 source, *local_slot + 1);
+    return source;
+  }
 
   const auto& mapping = netplay_client->GetWiimoteMapping();
   const auto& local_player_id = netplay_client->GetLocalPlayerId();

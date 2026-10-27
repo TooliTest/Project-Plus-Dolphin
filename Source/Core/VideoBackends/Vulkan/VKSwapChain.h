@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -66,8 +67,14 @@ public:
 
   // Retrieves the "next" fullscreen state. Safe to call off-thread.
   bool GetCurrentFullscreenState() const { return m_current_fullscreen_state; }
-  bool GetNextFullscreenState() const { return m_next_fullscreen_state; }
-  void SetNextFullscreenState(bool state) { m_next_fullscreen_state = state; }
+  bool GetNextFullscreenState() const
+  {
+    return m_fullscreen_requested.load(std::memory_order_acquire);
+  }
+  void SetNextFullscreenState(bool state)
+  {
+    m_fullscreen_requested.store(state, std::memory_order_release);
+  }
 
   // Updates the fullscreen state. Must call on-thread.
   bool SetFullscreenState(bool state);
@@ -99,7 +106,7 @@ private:
   bool m_vsync_enabled = false;
   bool m_fullscreen_supported = false;
   bool m_current_fullscreen_state = false;
-  bool m_next_fullscreen_state = false;
+  std::atomic<bool> m_fullscreen_requested{false};
   bool m_current_swap_chain_image_is_valid = false;
 
   VkSwapchainKHR m_swap_chain = VK_NULL_HANDLE;

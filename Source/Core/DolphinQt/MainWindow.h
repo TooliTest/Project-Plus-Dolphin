@@ -285,6 +285,8 @@ private:
     std::string project_plus_sd_path;
     std::string sd_card_path;
     std::string game_path;
+    std::string base_disc_path;
+    std::string replay_game_name;
     std::string game_id;
     u16 game_revision = 0;
     u8 game_platform = 2;

@@ -42,6 +42,7 @@
 #include "Common/CommonPaths.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
+#include "Common/IniFile.h"
 #include "Common/JsonUtil.h"
 #include "Common/Logging/Log.h"
 #include "Common/ScopeGuard.h"
@@ -58,10 +59,13 @@
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/NetplaySettings.h"
+#include "Core/Config/SessionSettings.h"
 #include "Core/Config/UISettings.h"
 #include "Core/Config/WiimoteSettings.h"
 #include "Core/Core.h"
 #include "Core/FreeLookManager.h"
+#include "Core/GeckoCode.h"
+#include "Core/GeckoCodeConfig.h"
 #include "Core/HW/DVD/DVDInterface.h"
 #include "Core/HW/GBAPad.h"
 #include "Core/HW/GCKeyboard.h"
@@ -172,6 +176,39 @@ static void InstallSignalHandler()
   sigaction(SIGTERM, &sa, nullptr);
 }
 #endif
+
+static void SetManagedDefaultIso(const std::string& path)
+{
+  Config::SetBase(Config::MAIN_DEFAULT_ISO, path);
+  Config::SetCurrent(Config::MAIN_DEFAULT_ISO, path);
+  Config::Save();
+}
+
+static bool LoadManagedReplayGeckoCodes(const std::string& path)
+{
+  if (path.empty())
+    return true;
+
+  Common::IniFile local_ini;
+  if (!local_ini.Load(path))
+  {
+    ERROR_LOG_FMT(NETPLAY, "Could not load managed replay Gecko code file: {}", path);
+    return false;
+  }
+
+  Common::IniFile global_ini;
+  std::vector<Gecko::GeckoCode> codes = Gecko::LoadCodes(global_ini, local_ini);
+  for (Gecko::GeckoCode& code : codes)
+    code.enabled = true;
+
+  Config::SetCurrent(Config::MAIN_ENABLE_CHEATS, true);
+  const std::vector<Gecko::GeckoCode> active_codes = Gecko::SetAndReturnActiveCodes(codes);
+  Gecko::UpdateSyncedCodes(active_codes);
+  Config::SetCurrent(Config::SESSION_CODE_SYNC_OVERRIDE, true);
+  NOTICE_LOG_FMT(NETPLAY, "Managed replay: loaded {} Gecko code(s) from '{}'", active_codes.size(),
+                 path);
+  return true;
+}
 
 static WindowSystemType GetWindowSystemType()
 {
@@ -2007,12 +2044,18 @@ void MainWindow::StartManagedNetPlay()
   const auto project_plus_sd_path = read_string("project_plus_sd_path");
   const auto custom_sd_card_path = read_string("sd_card_path");
   const auto custom_game_path = read_string("game_path");
+  const auto base_disc_path = read_string("base_disc_path");
+  const auto replay_game_name = read_string("replay_game_name");
   const auto custom_game_id = read_string("game_id");
   const auto status_path = read_string("status_path");
   const auto mode = read_string("mode");
   const auto replay_path = read_string("replay_path");
   const auto replay_output_path = read_string("replay_output_path");
   const auto replay_input_path = read_string("replay_input_path");
+  const auto gecko_codes_path = read_string("gecko_codes_path");
+  const auto wii_save_data_bin_path = read_string("wii_save_data_bin_path");
+  const auto replay_controller_tag = read_string("controller_tag");
+  const auto replay_controller_profile = read_string("controller_profile");
   const auto session_fingerprint = read_string("session_fingerprint");
   const auto gamecube_memory_card_path = read_string("gamecube_memory_card_path");
   const auto wii_nand_path = read_string("wii_nand_path");
@@ -2090,6 +2133,28 @@ void MainWindow::StartManagedNetPlay()
                  player_id.has_value(), rendezvous_address.has_value(),
                  rendezvous_token.has_value(), status_path.has_value(), ticket.size());
 
+  const auto prepare_replay_game_config =
+      [this, &gecko_codes_path, &wii_save_data_bin_path](const std::string& disc_path) -> bool {
+    if (gecko_codes_path && !LoadManagedReplayGeckoCodes(*gecko_codes_path))
+    {
+      FailManagedSession("The configured replay Gecko codes could not be loaded");
+      return false;
+    }
+    if (!wii_save_data_bin_path || wii_save_data_bin_path->empty())
+      return true;
+
+    const UICommon::GameFile disc(disc_path);
+    if (!disc.IsValid() || disc.GetTitleID() == 0 ||
+        WiiSave::ImportForNetplay(*wii_save_data_bin_path, disc.GetTitleID()) !=
+            WiiSave::CopyResult(0))
+    {
+      FailManagedSession(
+          "The configured replay Wii data.bin save is invalid or belongs to another game");
+      return false;
+    }
+    return true;
+  };
+
   if (mode == "netplay_replay")
   {
     if (match_id)
@@ -2105,7 +2170,44 @@ void MainWindow::StartManagedNetPlay()
 
     std::string launch_path;
     std::optional<std::string> sd_card_path;
-    if (*game == "Project+" || *game == "project-plus")
+    // Game-config tickets name the boot file and base disc explicitly. Tickets without a boot file
+    // use the built-in Brawl and Project+ selection below.
+    const bool config_driven = custom_game_path && !custom_game_path->empty();
+    const bool has_base_disc = config_driven && base_disc_path && !base_disc_path->empty();
+    if (config_driven)
+    {
+      if (!File::Exists(*custom_game_path) || (has_base_disc && !File::Exists(*base_disc_path)))
+      {
+        Rollback::StopNetplayReplay();
+        FailManagedSession("The configured replay game files are missing");
+        return;
+      }
+      launch_path = *custom_game_path;
+      if (has_base_disc)
+      {
+        SetManagedDefaultIso(*base_disc_path);
+        // A launcher chain-loads its base disc. A replay recorded after that hand-off starts from
+        // the disc itself; the first three ID characters identify the title in any region.
+        const UICommon::GameFile base_disc(*base_disc_path);
+        const std::string& recorded_game_id = Rollback::GetNetplayReplayGameID();
+        if (base_disc.IsValid() && base_disc.GetGameID().size() >= 3 &&
+            recorded_game_id.rfind(base_disc.GetGameID().substr(0, 3), 0) == 0)
+        {
+          launch_path = *base_disc_path;
+        }
+      }
+      if (custom_sd_card_path && !custom_sd_card_path->empty())
+      {
+        if (!File::Exists(*custom_sd_card_path))
+        {
+          Rollback::StopNetplayReplay();
+          FailManagedSession("The configured replay SD card is missing");
+          return;
+        }
+        sd_card_path = *custom_sd_card_path;
+      }
+    }
+    else if (*game == "Project+" || *game == "project-plus")
     {
       if (!brawl_iso_path || !project_plus_sd_path || !File::Exists(*project_plus_sd_path))
       {
@@ -2113,7 +2215,7 @@ void MainWindow::StartManagedNetPlay()
         FailManagedSession("The configured Project+ files are missing");
         return;
       }
-      Config::SetCurrent(Config::MAIN_DEFAULT_ISO, *brawl_iso_path);
+      SetManagedDefaultIso(*brawl_iso_path);
       sd_card_path = *project_plus_sd_path;
       launch_path =
           Rollback::GetNetplayReplayGameID().rfind("RSB", 0) == 0 ?
@@ -2129,21 +2231,7 @@ void MainWindow::StartManagedNetPlay()
         return;
       }
       launch_path = *brawl_iso_path;
-      Config::SetCurrent(Config::MAIN_DEFAULT_ISO, *brawl_iso_path);
-    }
-    else if (game->rfind("dolphin:", 0) == 0 && custom_game_path && File::Exists(*custom_game_path))
-    {
-      launch_path = *custom_game_path;
-      if (custom_sd_card_path && !custom_sd_card_path->empty())
-      {
-        if (!File::Exists(*custom_sd_card_path))
-        {
-          Rollback::StopNetplayReplay();
-          FailManagedSession("The configured custom-game SD card is missing");
-          return;
-        }
-        sd_card_path = *custom_sd_card_path;
-      }
+      SetManagedDefaultIso(*brawl_iso_path);
     }
     else
     {
@@ -2189,10 +2277,17 @@ void MainWindow::StartManagedNetPlay()
     // recorded it (for example, Brawl takes a different banner/save-loading path).
     std::vector<u64> replay_wii_titles;
     const std::string& replay_disc_path =
-        (*game == "Project+" || *game == "project-plus" || *game == "Brawl" || *game == "brawl") ?
-            *brawl_iso_path :
-            launch_path;
+        has_base_disc ? *base_disc_path :
+        (!config_driven && (*game == "Project+" || *game == "project-plus" || *game == "Brawl" ||
+                            *game == "brawl")) ?
+                        *brawl_iso_path :
+                        launch_path;
     const UICommon::GameFile replay_game(replay_disc_path);
+    if (!prepare_replay_game_config(replay_disc_path))
+    {
+      Rollback::StopNetplayReplay();
+      return;
+    }
     if (replay_game.IsValid() && replay_game.GetTitleID() != 0 &&
         (replay_game.GetPlatform() == DiscIO::Platform::WiiDisc ||
          replay_game.GetPlatform() == DiscIO::Platform::WiiWAD))
@@ -2213,14 +2308,16 @@ void MainWindow::StartManagedNetPlay()
       m_managed_session->match_id = *match_id;
     if (status_path)
       m_managed_session->status_path = *status_path;
-    if (!match_id || !game || !brawl_iso_path || !status_path || !replay_path ||
-        !File::Exists(*replay_path))
+    if (!match_id || !game || !status_path || !replay_path || !File::Exists(*replay_path))
     {
       FailManagedSession("The replay launch ticket is incomplete");
       return;
     }
 
-    const UICommon::GameFile brawl_iso(*brawl_iso_path);
+    const bool config_driven = custom_game_path && !custom_game_path->empty();
+    const bool has_base_disc = base_disc_path && !base_disc_path->empty();
+    const std::string disc_path = has_base_disc ? *base_disc_path : brawl_iso_path.value_or("");
+    const UICommon::GameFile brawl_iso(disc_path);
     const std::string& brawl_game_id = brawl_iso.GetGameID();
     if (!brawl_iso.IsValid() || (brawl_game_id != "RSBE01" && brawl_game_id != "RSBP01" &&
                                  brawl_game_id != "RSBJ01" && brawl_game_id != "RSBK01"))
@@ -2229,10 +2326,44 @@ void MainWindow::StartManagedNetPlay()
       return;
     }
 
-    std::string launch_path = *brawl_iso_path;
+    std::string launch_path = disc_path;
     std::optional<std::string> sd_card_path;
-    const bool project_plus = *game == "Project+";
-    if (project_plus)
+    const bool project_plus = *game == "project-plus" || *game == "Project+" ||
+                              replay_game_name.value_or("") == "Project+";
+    if (config_driven)
+    {
+      if (!File::Exists(*custom_game_path))
+      {
+        FailManagedSession("The configured replay launcher is missing");
+        return;
+      }
+      launch_path = *custom_game_path;
+      if (*game == "project-plus")
+      {
+        launch_path =
+            File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "Project+ Offline Launcher.dol";
+      }
+      else if (*game == "brawl")
+      {
+        launch_path =
+            File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "vBrawl Offline Launcher.dol";
+      }
+      if (!File::Exists(launch_path))
+      {
+        FailManagedSession("The configured replay launcher is missing");
+        return;
+      }
+      if (custom_sd_card_path && !custom_sd_card_path->empty())
+      {
+        if (!File::Exists(*custom_sd_card_path))
+        {
+          FailManagedSession("The configured replay SD card is missing");
+          return;
+        }
+        sd_card_path = *custom_sd_card_path;
+      }
+    }
+    else if (project_plus)
     {
       if (!project_plus_sd_path || !File::Exists(*project_plus_sd_path))
       {
@@ -2243,31 +2374,56 @@ void MainWindow::StartManagedNetPlay()
           File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "Project+ Offline Launcher.dol";
       sd_card_path = *project_plus_sd_path;
     }
-    else if (*game != "Brawl")
+    else if (*game != "Brawl" && *game != "brawl")
     {
       FailManagedSession("The replay game is unsupported");
       return;
     }
 
-    Config::SetCurrent(Config::MAIN_DEFAULT_ISO, *brawl_iso_path);
+    if (!prepare_replay_game_config(disc_path))
+      return;
+
+    SetManagedDefaultIso(disc_path);
     Config::SetCurrent(Config::MAIN_WII_SD_CARD, sd_card_path.has_value());
     Config::SetCurrent(Config::MAIN_WII_SD_CARD_ENABLE_FOLDER_SYNC, false);
+    Config::SetCurrent(Config::MAIN_ALLOW_SD_WRITES, false);
     Config::SetCurrent(Config::MAIN_WII_SD_CARD_IMAGE_PATH, sd_card_path.value_or(""));
     Config::SetCurrent(Config::MAIN_REPLAY_PLAYBACK_FILE, *replay_path);
     Config::SetCurrent(Config::MAIN_REPLAY_PLAYBACK_PROJECT_PLUS, project_plus);
     Config::SetCurrent(Config::NETPLAY_BRAWL_MUSIC_OFF, disable_project_plus_music);
     File::SetUserPath(F_WIISDCARDIMAGE_IDX, sd_card_path.value_or(""));
-    // Replay-menu navigation is generated internally and must not depend on a physical adapter or
-    // the user's persistent port configuration.
-    for (int port = 0; port < SerialInterface::MAX_SI_CHANNELS; ++port)
+    // Managed multiplayer installations may intentionally leave every emulated SI port disabled
+    // because Gekko samples the local controller independently of the in-game seat. Native replay
+    // playback has no Gekko session, so it needs a real local port-one SI device for both the
+    // automatic Z/A menu sequence and the user's live inputs. This current-run override is cleared
+    // at shutdown and never changes Dolphin.ini.
+    const SerialInterface::SIDevices replay_si_device =
+        Config::Get(Config::GetInfoForSIDevice(0));
+    if (!SerialInterface::SIDevice_IsGCController(replay_si_device))
     {
-      Config::SetCurrent(Config::GetInfoForSIDevice(port),
-                         port == 0 ? SerialInterface::SIDEVICE_GC_CONTROLLER :
-                                     SerialInterface::SIDEVICE_NONE);
-      Config::SetCurrent(Config::GetInfoForWiimoteSource(port), WiimoteSource::None);
+      Config::SetCurrent(Config::GetInfoForSIDevice(0),
+                         SerialInterface::SIDEVICE_WIIU_ADAPTER);
+      NOTICE_LOG_FMT(NETPLAY,
+                     "Managed native replay: temporarily attached local GameCube port 1 "
+                     "to the adapter (configured SI device={})",
+                     static_cast<int>(replay_si_device));
     }
     auto boot_session_data = std::make_unique<BootSessionData>();
     boot_session_data->SetBrawlReplay(*replay_path, project_plus);
+    std::vector<Rollback::BrawlControllerProfile> replay_profiles;
+    if (replay_controller_tag && replay_controller_profile && !replay_controller_tag->empty())
+    {
+      const auto profile = Rollback::ParseBrawlControllerProfile(*replay_controller_tag,
+                                                                 *replay_controller_profile);
+      if (!profile)
+      {
+        FailManagedSession("The replay controller profile is invalid");
+        return;
+      }
+      replay_profiles.push_back(*profile);
+    }
+    boot_session_data->SetBrawlControllerProfiles(std::move(replay_profiles));
+    boot_session_data->SetWiiSyncData(nullptr, {brawl_iso.GetTitleID()}, "", [] {});
     ReportManagedStatus("preparing");
     StartGame(launch_path, ScanForSecondDisc::No, std::move(boot_session_data));
     return;
@@ -2307,6 +2463,8 @@ void MainWindow::StartManagedNetPlay()
   m_managed_session->project_plus_sd_path = project_plus_sd_path.value_or("");
   m_managed_session->sd_card_path = custom_sd_card_path.value_or("");
   m_managed_session->game_path = custom_game_path.value_or("");
+  m_managed_session->base_disc_path = base_disc_path.value_or("");
+  m_managed_session->replay_game_name = replay_game_name.value_or("");
   m_managed_session->game_id = custom_game_id.value_or("");
   if (game_revision_it != ticket.end() && game_revision_it->second.is<double>())
     m_managed_session->game_revision = static_cast<u16>(game_revision_it->second.get<double>());
@@ -2572,7 +2730,55 @@ void MainWindow::StartManagedNetPlay()
 
   std::string game_path;
   std::optional<std::string> sd_card_path;
-  if (m_managed_session->game == "project-plus")
+  // Game-config tickets name the boot file, and launchers also name the base disc they chain-load.
+  // Tickets without a boot file use the built-in Brawl and Project+ selection below.
+  const bool config_driven = !m_managed_session->game_path.empty() ||
+                             m_managed_session->game.rfind("dolphin:", 0) == 0;
+  if (config_driven)
+  {
+    const UICommon::GameFile custom_game(m_managed_session->game_path);
+    NOTICE_LOG_FMT(NETPLAY,
+                   "Managed launch: game path='{}', exists={}, valid={}, game_id='{}', "
+                   "revision={} (expected game_id='{}', revision={}); base disc='{}'",
+                   m_managed_session->game_path, File::Exists(m_managed_session->game_path),
+                   custom_game.IsValid(), custom_game.GetGameID(), custom_game.GetRevision(),
+                   m_managed_session->game_id, m_managed_session->game_revision,
+                   m_managed_session->base_disc_path);
+    if (!custom_game.IsValid() || custom_game.GetGameID() != m_managed_session->game_id ||
+        custom_game.GetRevision() != m_managed_session->game_revision)
+    {
+      FailManagedSession("The selected game does not match the lobby game ID and revision");
+      m_managed_session.reset();
+      return;
+    }
+    if (!m_managed_session->base_disc_path.empty())
+    {
+      const UICommon::GameFile base_disc(m_managed_session->base_disc_path);
+      if (!base_disc.IsValid())
+      {
+        FailManagedSession("The configured base disc is missing or invalid");
+        m_managed_session.reset();
+        return;
+      }
+      SetManagedDefaultIso(m_managed_session->base_disc_path);
+    }
+    Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME,
+                       !m_managed_session->replay_game_name.empty() ?
+                           m_managed_session->replay_game_name :
+                           custom_game.GetName(UICommon::GameFile::Variant::LongAndPossiblyCustom));
+    game_path = m_managed_session->game_path;
+    if (!m_managed_session->sd_card_path.empty())
+    {
+      if (!File::Exists(m_managed_session->sd_card_path))
+      {
+        FailManagedSession("The configured SD card is missing");
+        m_managed_session.reset();
+        return;
+      }
+      sd_card_path = m_managed_session->sd_card_path;
+    }
+  }
+  else if (m_managed_session->game == "project-plus")
   {
     const UICommon::GameFile brawl_iso(m_managed_session->brawl_iso_path);
     const std::string& brawl_game_id = brawl_iso.GetGameID();
@@ -2589,7 +2795,7 @@ void MainWindow::StartManagedNetPlay()
       m_managed_session.reset();
       return;
     }
-    Config::SetCurrent(Config::MAIN_DEFAULT_ISO, m_managed_session->brawl_iso_path);
+    SetManagedDefaultIso(m_managed_session->brawl_iso_path);
     Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME, "Project+");
     game_path = File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "Project+ Netplay Launcher.dol";
     NOTICE_LOG_FMT(NETPLAY,
@@ -2623,7 +2829,7 @@ void MainWindow::StartManagedNetPlay()
       m_managed_session.reset();
       return;
     }
-    Config::SetCurrent(Config::MAIN_DEFAULT_ISO, m_managed_session->brawl_iso_path);
+    SetManagedDefaultIso(m_managed_session->brawl_iso_path);
     Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME, "Brawl");
     game_path = File::GetUserPath(D_USER_IDX) + "Launcher" DIR_SEP "vBrawl Netplay Launcher.dol";
     if (m_managed_session->sd_card_path.empty() || !File::Exists(m_managed_session->sd_card_path))
@@ -2633,36 +2839,6 @@ void MainWindow::StartManagedNetPlay()
       return;
     }
     sd_card_path = m_managed_session->sd_card_path;
-  }
-  else if (m_managed_session->game.rfind("dolphin:", 0) == 0)
-  {
-    const UICommon::GameFile custom_game(m_managed_session->game_path);
-    NOTICE_LOG_FMT(NETPLAY,
-                   "Managed launch: custom game path='{}', exists={}, valid={}, game_id='{}', "
-                   "revision={} (expected game_id='{}', revision={})",
-                   m_managed_session->game_path, File::Exists(m_managed_session->game_path),
-                   custom_game.IsValid(), custom_game.GetGameID(), custom_game.GetRevision(),
-                   m_managed_session->game_id, m_managed_session->game_revision);
-    if (!custom_game.IsValid() || custom_game.GetGameID() != m_managed_session->game_id ||
-        custom_game.GetRevision() != m_managed_session->game_revision)
-    {
-      FailManagedSession("The selected custom game does not match the lobby game ID and revision");
-      m_managed_session.reset();
-      return;
-    }
-    Config::SetCurrent(Config::MAIN_NETPLAY_REPLAY_GAME,
-                       custom_game.GetName(UICommon::GameFile::Variant::LongAndPossiblyCustom));
-    game_path = m_managed_session->game_path;
-    if (!m_managed_session->sd_card_path.empty())
-    {
-      if (!File::Exists(m_managed_session->sd_card_path))
-      {
-        FailManagedSession("The configured custom-game SD card is missing");
-        m_managed_session.reset();
-        return;
-      }
-      sd_card_path = m_managed_session->sd_card_path;
-    }
   }
   else
   {
@@ -2683,11 +2859,10 @@ void MainWindow::StartManagedNetPlay()
   if (!selected_game_valid || !selected_game_registered)
   {
     const QString detail =
+        config_driven ? tr("The selected game could not be opened.") :
         m_managed_session->game == "brawl" ?
             tr("vBrawl Netplay Launcher.dol was not found in this Dolphin user folder.") :
-        m_managed_session->game == "project-plus" ?
-            tr("Project+ Netplay Launcher.dol was not found in this Dolphin user folder.") :
-            tr("The selected custom game could not be opened.");
+            tr("Project+ Netplay Launcher.dol was not found in this Dolphin user folder.");
     FailManagedSession(detail.toStdString());
     m_managed_session.reset();
     return;
@@ -2721,7 +2896,10 @@ void MainWindow::StartManagedNetPlay()
   if (m_managed_session->seat == 1)
   {
     Settings::Instance().ResetNetPlayServer(new NetPlay::NetPlayServer(
-        0, false, m_netplay_dialog, NetPlay::NetTraversalConfig{false, {}, 0, 0}));
+        0, false, m_netplay_dialog, NetPlay::NetTraversalConfig{false, {}, 0, 0},
+        NetPlay::ManagedNetPlayHostConfig{m_managed_session->match_id,
+                                         m_managed_session->player_ids,
+                                         m_managed_session->session_fingerprint}));
     const auto server = Settings::Instance().GetNetPlayServer();
     if (!server || !server->is_connected)
     {
@@ -2729,8 +2907,6 @@ void MainWindow::StartManagedNetPlay()
       NetPlayQuit();
       return;
     }
-    server->SetManagedPlayers(m_managed_session->match_id, m_managed_session->player_ids,
-                              m_managed_session->session_fingerprint);
     server->SetManagedGeckoCodesPath(m_managed_session->gecko_codes_path);
     server->ChangeGame(selected_game.GetSyncIdentifier(),
                        m_game_list->GetNetPlayName(selected_game));
@@ -3299,8 +3475,11 @@ void MainWindow::OnStopRecording()
           m_managed_session->replay_output_path + DIR_SEP "Netplay" DIR_SEP;
       if (File::CreateFullPath(directory))
       {
-        const std::string replay_path = directory + m_managed_session->match_id + "-p" +
-                                        std::to_string(m_managed_session->seat) + ".npr";
+        const std::string players = Config::Get(Config::MAIN_NETPLAY_REPLAY_PLAYERS);
+        const std::string replay_path =
+            directory + m_managed_session->match_id + "-p" +
+            std::to_string(m_managed_session->seat) + (players.empty() ? "" : " " + players) +
+            ".npr";
         saved = Rollback::SaveNetplayReplay(replay_path);
         if (saved)
           INFO_LOG_FMT(NETPLAY, "Saved managed Netplay Replay to {}", replay_path);

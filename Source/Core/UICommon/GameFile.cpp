@@ -100,7 +100,7 @@ GameFile::GameFile() = default;
 
 GameFile::GameFile(std::string path) : m_file_path(std::move(path))
 {
-  m_file_name = PathToFileName(m_file_path);
+  m_file_name = PathToFileName(WithUnifiedPathSeparators(m_file_path));
 
   {
     std::unique_ptr<DiscIO::Volume> volume(DiscIO::CreateVolume(m_file_path));

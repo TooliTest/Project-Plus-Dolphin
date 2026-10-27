@@ -204,6 +204,7 @@ static void InitializeDeterministicWiiSaves(FS::FileSystem* session_fs,
   const bool netplay_replay = boot_session_data.IsNetplayReplay() ||
                               Rollback::IsNetplayReplayPlaying() ||
                               Rollback::IsNetplayReplayInputActive();
+  const bool brawl_replay = !boot_session_data.GetBrawlReplayPath().empty();
   const u64 title_id = SConfig::GetInstance().GetTitleID();
   const auto configured_fs = FS::MakeFileSystem(FS::Location::Configured);
   if (movie.IsRecordingInput())
@@ -220,7 +221,7 @@ static void InitializeDeterministicWiiSaves(FS::FileSystem* session_fs,
     }
   }
 
-  if (netplay_replay ||
+  if (netplay_replay || brawl_replay ||
       (NetPlay::IsNetPlayRunning() && SConfig::GetInstance().bCopyWiiSaveNetplay) ||
       (movie.IsMovieActive() && !movie.IsStartingFromClearSave()))
   {
@@ -301,6 +302,63 @@ static void MoveToBackupIfExists(const std::string& path)
   }
 }
 
+static void StageBrawlReplay(const std::string& replay_file,
+                             const std::shared_ptr<FS::FileSystem>& fs)
+{
+  NOTICE_LOG_FMT(IOS_FS, "Staging Brawl replay {} in the temporary NAND", replay_file);
+
+  // The deterministic Brawl save can contain bundled or previously recorded replay entries.
+  // Native playback must expose exactly the replay selected by the user, so clean only the
+  // temporary session VFF before inserting it. The packaged/configured source save is untouched.
+  std::vector<IOS::HLE::NWC24::VFFFile> existing_replays;
+  const auto read_result = IOS::HLE::NWC24::ReadDirectoryFromVFF(
+      std::string(BRAWL_REPLAY_VFF), "/rp", fs, existing_replays);
+  if (read_result != IOS::HLE::NWC24::WC24_OK)
+  {
+    ERROR_LOG_FMT(IOS_FS, "Could not inspect the temporary Brawl replay directory");
+    return;
+  }
+  for (const auto& existing : existing_replays)
+  {
+    const std::string existing_path = "/rp/" + existing.name;
+    if (IOS::HLE::NWC24::DeleteFileFromVFF(std::string(BRAWL_REPLAY_VFF), existing_path, fs) !=
+        IOS::HLE::NWC24::WC24_OK)
+    {
+      ERROR_LOG_FMT(IOS_FS, "Could not remove existing temporary Brawl replay {}", existing_path);
+      return;
+    }
+  }
+  NOTICE_LOG_FMT(IOS_FS, "Cleared {} existing replay file(s) from the temporary Brawl VFF",
+                 existing_replays.size());
+
+  std::vector<u8> replay_bytes;
+  File::IOFile source(replay_file, "rb");
+  if (!source.IsOpen())
+  {
+    ERROR_LOG_FMT(IOS_FS, "Could not open Brawl replay {}", replay_file);
+    return;
+  }
+
+  replay_bytes.resize(static_cast<size_t>(source.GetSize()));
+  if (!source.ReadBytes(replay_bytes.data(), replay_bytes.size()))
+  {
+    ERROR_LOG_FMT(IOS_FS, "Could not read Brawl replay {}", replay_file);
+    return;
+  }
+
+  std::string replay_name = std::filesystem::path(replay_file).filename().string();
+  const size_t native_name = replay_name.rfind("rp_");
+  if (native_name != std::string::npos)
+    replay_name.erase(0, native_name);
+  replay_name = "/rp/" + replay_name;
+  const auto result = IOS::HLE::NWC24::WriteToVFF(std::string(BRAWL_REPLAY_VFF), replay_name, fs,
+                                                  replay_bytes);
+  if (result != IOS::HLE::NWC24::WC24_OK)
+    ERROR_LOG_FMT(IOS_FS, "Could not insert replay {} into the temporary NAND", replay_file);
+  else
+    INFO_LOG_FMT(IOS_FS, "Inserted replay {} into temporary NAND as {}", replay_file, replay_name);
+}
+
 void InitializeWiiRoot(bool use_temporary, const BootSessionData* boot_session_data)
 {
   ASSERT(!s_wii_root_initialized);
@@ -324,41 +382,6 @@ void InitializeWiiRoot(bool use_temporary, const BootSessionData* boot_session_d
 
     File::SetUserPath(D_SESSION_WIIROOT_IDX, s_temp_wii_root);
 	File::Copy(File::GetSysDirectory() + NETPLAY_SAVE_DIR, s_temp_wii_root);
-
-    if (!replay_file.empty())
-    {
-      NOTICE_LOG_FMT(IOS_FS, "Staging Brawl replay {} in the temporary NAND", replay_file);
-      std::vector<u8> replay_bytes;
-      File::IOFile source(replay_file, "rb");
-      if (!source.IsOpen())
-      {
-        ERROR_LOG_FMT(IOS_FS, "Could not open Brawl replay {}", replay_file);
-      }
-      else
-      {
-        replay_bytes.resize(static_cast<size_t>(source.GetSize()));
-        if (!source.ReadBytes(replay_bytes.data(), replay_bytes.size()))
-        {
-          ERROR_LOG_FMT(IOS_FS, "Could not read Brawl replay {}", replay_file);
-        }
-        else
-        {
-          std::string replay_name = std::filesystem::path(replay_file).filename().string();
-          const size_t native_name = replay_name.rfind("rp_");
-          if (native_name != std::string::npos)
-            replay_name.erase(0, native_name);
-          replay_name = "/rp/" + replay_name;
-          const auto fs = std::make_shared<FS::HostFileSystem>(s_temp_wii_root);
-          const auto result = IOS::HLE::NWC24::WriteToVFF(
-              "/title/00010000/52534245/data/collect.vff", replay_name, fs, replay_bytes);
-          if (result != IOS::HLE::NWC24::WC24_OK)
-            ERROR_LOG_FMT(IOS_FS, "Could not insert replay {} into the temporary NAND", replay_file);
-          else
-            INFO_LOG_FMT(IOS_FS, "Inserted replay {} into temporary NAND as {}", replay_file,
-                         replay_name);
-        }
-      }
-    }
   }
   else
   {
@@ -550,6 +573,14 @@ void InitializeWiiFileSystemContents(
     }
 
     InitializeDeterministicWiiSaves(fs.get(), boot_session_data);
+    // Save initialization can replace Brawl's collect.vff. Stage the selected replay only after
+    // the configured save and controller profiles have reached their final session-NAND state.
+    const std::string replay_file = !boot_session_data.GetBrawlReplayPath().empty() ?
+                                        boot_session_data.GetBrawlReplayPath() :
+                                        Config::Get(Config::MAIN_REPLAY_PLAYBACK_FILE);
+    if (!replay_file.empty())
+      StageBrawlReplay(replay_file, fs);
+
     if (boot_session_data.IsNetplayReplay() || Rollback::IsNetplayReplayPlaying() ||
         Rollback::IsNetplayReplayInputActive())
     {
