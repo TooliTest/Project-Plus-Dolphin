@@ -3,7 +3,7 @@
 branch=`echo ${GITHUB_REF##*/}`
 
 BUILDBIN=/dolphin/dolphin/build/Binaries
-BINFILE=Brawlback_Dolphin-x86_64.AppImage
+BINFILE=Project+_Dolphin-x86_64.AppImage
 LOG_FILE=$HOME/curl.log
 CXX=g++-9
 
@@ -23,7 +23,7 @@ cd /tmp
 ./linuxdeployqt-continuous-x86_64.AppImage --appimage-extract
 cd $HOME
 mkdir -p squashfs-root/usr/bin
-cp -P "$BUILDBIN"/brawlback-dolphin $HOME/squashfs-root/usr/bin/
+cp -P "$BUILDBIN"/project-plus-dolphin $HOME/squashfs-root/usr/bin/
 
 curl -sL https://raw.githubusercontent.com/Project-Plus-Development-Team/Project-Plus-Dolphin/$branch/Data/project-plus-dolphin.svg -o ./squashfs-root/project-plus-dolphin.svg
 curl -sL https://raw.githubusercontent.com/Project-Plus-Development-Team/Project-Plus-Dolphin/$branch/Data/project-plus-dolphin.desktop -o ./squashfs-root/project-plus-dolphin.desktop
@@ -55,8 +55,8 @@ unset QT_PLUGIN_PATH
 unset LD_LIBRARY_PATH
 unset QTDIR
 
-# /tmp/squashfs-root/AppRun $HOME/squashfs-root/usr/bin/pbrawlback-dolphin -appimage -unsupported-allow-new-glibc -no-copy-copyright-files -no-translations -bundle-non-qt-libs
-/tmp/squashfs-root/AppRun $HOME/squashfs-root/usr/bin/brawlback-dolphin -unsupported-allow-new-glibc -no-copy-copyright-files -no-translations -bundle-non-qt-libs
+# /tmp/squashfs-root/AppRun $HOME/squashfs-root/usr/bin/brawlback-dolphin -appimage -unsupported-allow-new-glibc -no-copy-copyright-files -no-translations -bundle-non-qt-libs
+/tmp/squashfs-root/AppRun $HOME/squashfs-root/usr/bin/project-plus-dolphin -unsupported-allow-new-glibc -no-copy-copyright-files -no-translations -bundle-non-qt-libs
 export PATH=$(readlink -f /tmp/squashfs-root/usr/bin/):$PATH
 
 # Add AppImageUpdate as the internal updater
@@ -71,13 +71,13 @@ cp /lib/x86_64-linux-gnu/libtinfo.so.5 $HOME/squashfs-root/usr/lib/
 cp /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0 $HOME/squashfs-root/usr/lib/
 
 # Package AppImage
-/tmp/squashfs-root/usr/bin/appimagetool $HOME/squashfs-root -u "gh-releases-zsync|qurious-pixel|dolphin|continuous|Brawlback_Dolphin-x86_64.AppImage.zsync"
+/tmp/squashfs-root/usr/bin/appimagetool $HOME/squashfs-root -u "gh-releases-zsync|qurious-pixel|dolphin|continuous|Project+_Dolphin-x86_64.AppImage.zsync"
 
 mkdir $HOME/artifacts/
 mkdir -p /dolphin/artifacts/
-mv Brawlback_Dolphin-x86_64.AppImage* $HOME/artifacts
+mv Project+_Dolphin-x86_64.AppImage* $HOME/artifacts
 cp -R $HOME/artifacts/ /dolphin/
-cp $BUILDBIN/brawlback-dolphin /dolphin/artifacts
+cp $BUILDBIN/project-plus-dolphin /dolphin/artifacts
 chmod -R 777 /dolphin/artifacts
 cd /dolphin/artifacts
 ls -al /dolphin/artifacts/
