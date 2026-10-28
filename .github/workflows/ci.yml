@@ -355,7 +355,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Project-Plus-Dolphin-${{ env.DOLPHINVER }}
-        path: "$GITHUB_WORKSPACE"/squashfs-root/
+        path: squashfs-root/
       env:
         DEFAULT_BRANCH: git-actions
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
