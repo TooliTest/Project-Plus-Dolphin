@@ -295,7 +295,7 @@ jobs:
     - name: Package Dolphin-Binary
       run: |
         mkdir -p $GITHUB_WORKSPACE/{artifacts,uploads}
-        cp -P build/install/usr/bin/brawlback-dolphin $GITHUB_WORKSPACE/artifacts
+        cp -P build/install/usr/bin/project-plus $GITHUB_WORKSPACE/artifacts
     - name: Package Dolphin-AppImage
       env:
         QT_BASE_DIR: /qt/${{ env.yaqti }}/gcc_64
